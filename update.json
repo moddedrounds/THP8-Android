@@ -1,8 +1,8 @@
 {
-  "versionCode": 120,
-  "versionName": "1.2.0",
-  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.0/THP8-Android.apk",
-  "sha256": "0262617255e799094ccd455b55a32e61121e4926d107eeb80b269f9d473b5655",
-  "size": 86868833,
-  "notes": "Runs on more phones: per-GPU graphics driver (Turnip 8xx for Snapdragon 8 Elite), Mali/PowerVR support, cooler CPU placement, resolution defaults by device."
+  "versionCode": 121,
+  "versionName": "1.2.1",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.1/THP8-Android.apk",
+  "sha256": "d15521a6e513c78cfaecd1b35bc9344f4d16dd05409d28206a02fed72a04ad7b",
+  "size": 86876161,
+  "notes": "Pauses in the background (no longer slows other apps); fixes the black screen after switching back."
 }
