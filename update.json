@@ -1,8 +1,8 @@
 {
-  "versionCode": 121,
-  "versionName": "1.2.1",
-  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.1/THP8-Android.apk",
-  "sha256": "d15521a6e513c78cfaecd1b35bc9344f4d16dd05409d28206a02fed72a04ad7b",
-  "size": 86876161,
-  "notes": "Pauses in the background (no longer slows other apps); fixes the black screen after switching back."
+  "versionCode": 122,
+  "versionName": "1.2.2",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.2/THP8-Android.apk",
+  "sha256": "73107e78ad2d3e9ebbd00240f7ec80ca03342bce566ddec50357e70eb1aacb1e",
+  "size": 86881185,
+  "notes": "New: Import driver (.zip) - load a Turnip / AdrenoTools driver from your storage."
 }
