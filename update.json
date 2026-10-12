@@ -1,8 +1,8 @@
 {
-  "versionCode": 110,
-  "versionName": "1.1.0",
-  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.1.0/THP8-Android.apk",
-  "sha256": "be05ea4b5e77e01bb5fea7dfb4123e89acf9a37a02b2db76851e4b6741b32c55",
-  "size": 72893551,
-  "notes": "In-app update checks"
+  "versionCode": 120,
+  "versionName": "1.2.0",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.0/THP8-Android.apk",
+  "sha256": "0262617255e799094ccd455b55a32e61121e4926d107eeb80b269f9d473b5655",
+  "size": 86868833,
+  "notes": "Runs on more phones: per-GPU graphics driver (Turnip 8xx for Snapdragon 8 Elite), Mali/PowerVR support, cooler CPU placement, resolution defaults, RB2 resolution option."
 }
