@@ -1,8 +1,8 @@
 {
-  "versionCode": 123,
-  "versionName": "1.2.3",
-  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.3/THP8-Android.apk",
-  "sha256": "57dd903ab242be08b4aaa8f9260ed6d5f5d76dffd5bfbc187470d332b4407f98",
+  "versionCode": 124,
+  "versionName": "1.2.4",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.4/THP8-Android.apk",
+  "sha256": "68d06362441be1198cdf68a5f5caa6de9fa26f4bd576776796e4046fed1d926d",
   "size": 87255289,
-  "notes": "New icon; the launcher background now comes from your own installed game."
+  "notes": "Default frame rate is now locked 30 (no frame generation) for new installs."
 }
