@@ -9,6 +9,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Where things live and which command-line settings the game starts with.
@@ -79,11 +81,6 @@ final class LaunchConfig {
         // instead of dumping it to the EDRAM buffer first (SDK 0021; garage GPU 21.9 -> 18.9 ms,
         // static picture bit-identical).
         "--gpu_fused_resolve=true",
-        // Mesa Turnip, bundled in the APK (tools/android/fetch_turnip.sh): renders without the stock
-        // driver's blue-haze bug and skates as fast or faster. Falls back to the stock driver when
-        // the bundle is missing or twice failed to start. Override with --android_vulkan_driver=
-        // (empty) in args.txt to force the stock driver.
-        "--android_vulkan_driver=turnip",
         // CPU waste found by profiling the Thor (guest threads spinning on frame counters and in
         // polling waits) and the scheduler stacking the hottest threads on the one prime core.
         "--guest_counter2_wait=true",
@@ -111,8 +108,23 @@ final class LaunchConfig {
     // Player options chosen in the launcher (SharedPreferences "options"); args.txt still wins.
     static final int[] RENDER_SCALES = {100, 85, 75, 60, 50};
 
+    /**
+     * Starting resolution until the player picks one: handhelds with a fan (AYN Thor / Odin, Retroid,
+     * Ayaneo, Anbernic) render at 100 %; phones throttle hard when hot (a Galaxy S25 Ultra fell to
+     * 18 fps at locked 30 once warm), so high-end Snapdragons (Adreno 7xx / 8xx) start at 85 % and
+     * everything else at 75 %. FSR 1 scales the picture back up.
+     */
+    static int defaultRenderScale(Context context) {
+        String maker = (android.os.Build.MANUFACTURER + " " + android.os.Build.BRAND).toLowerCase(java.util.Locale.US);
+        for (String handheld : new String[] {"ayn", "retroid", "ayaneo", "anbernic", "odin"}) {
+            if (maker.contains(handheld)) return 100;
+        }
+        int generation = adrenoGeneration(context);
+        return generation >= 7 ? 85 : 75;
+    }
+
     static int renderScale(Context context) {
-        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("render_scale", 100);
+        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("render_scale", defaultRenderScale(context));
     }
 
     // Frame rate modes: 0 = locked 30 shown at 60 with frame generation (default), 1 = locked 30,
@@ -193,6 +205,101 @@ final class LaunchConfig {
         return eq < 0 ? arg : arg.substring(0, eq);
     }
 
+    private static final Pattern ADRENO = Pattern.compile("Adreno \\(TM\\) (\\d)\\d\\d");
+
+    /** The Vulkan GPU name ("Adreno (TM) 740"), probed once and remembered. */
+    static String gpuName(Context context) {
+        android.content.SharedPreferences prefs = context.getSharedPreferences("device", Context.MODE_PRIVATE);
+        String name = prefs.getString("gpu_name", null);
+        if (name == null) {
+            name = "";
+            try {
+                Matcher m = Pattern.compile("== Device 0: (.+) ==").matcher(VulkanProbe.run());
+                if (m.find()) name = m.group(1).trim();
+            } catch (Throwable ignored) {
+            }
+            prefs.edit().putString("gpu_name", name).apply();
+        }
+        return name;
+    }
+
+    /** 6, 7, 8 ... for an Adreno 6xx / 7xx / 8xx, 0 for any other GPU. */
+    static int adrenoGeneration(Context context) {
+        Matcher m = ADRENO.matcher(gpuName(context));
+        return m.find() ? Integer.parseInt(m.group(1)) : 0;
+    }
+
+    // Graphics driver (SharedPreferences "options" gpu_driver). Automatic picks per GPU: the bundled
+    // Turnip on Adreno 6xx / 7xx, AUTO_8XX on Adreno 8xx, and the phone's own driver on everything
+    // else (Mali, PowerVR, Xclipse, older Adreno). Before using a custom driver the game checks that
+    // it finds the GPU, and falls back to the phone's driver when it does not (custom_driver.cpp).
+    static final int DRIVER_AUTO = 0, DRIVER_SYSTEM = 1, DRIVER_TURNIP = 2, DRIVER_TURNIP8 = 3;
+    static final String[] DRIVER_NAMES = {"Automatic", "Phone's own", "Turnip (Adreno 6xx/7xx)",
+            "Turnip 8xx (experimental)"};
+    // Folder under assets/drivers/ (tools/android/fetch_turnip.sh) and the library inside it.
+    // Turnip 6xx/7xx falls back to the newer a8xx build (Mesa main) on Adreno 7xx variants R8 does not
+    // know; the game uses the first folder whose driver finds the GPU (custom_driver.cpp).
+    private static final String[] DRIVER_FOLDERS = {null, null, "turnip,turnip8", "turnip8"};
+    private static final String[] DRIVER_LIBS = {null, null, "vulkan.ad07xx.so", "libvulkan_freedreno.so"};
+    // The a8xx build draws with page faults through GMEM on the Adreno 830; sysmem rendering is clean.
+    private static final String[] DRIVER_ENV = {null, null, null, "TU_DEBUG=sysmem"};
+    // Turnip renders without the stock Adreno driver's blue-haze / flicker bug (Thor's Adreno 740,
+    // and the S25 Ultra's Adreno 830 with the a8xx build) and skates as fast or faster.
+    static final int AUTO_8XX = DRIVER_TURNIP8;
+
+    static int driverChoice(Context context) {
+        int c = context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("gpu_driver", DRIVER_AUTO);
+        return c >= 0 && c < DRIVER_NAMES.length ? c : DRIVER_AUTO;
+    }
+
+    /** Choosing a driver again also forgets that it failed to start before. */
+    static void setDriverChoice(Context context, int choice) {
+        context.getSharedPreferences("options", Context.MODE_PRIVATE).edit().putInt("gpu_driver", choice).apply();
+        String folder = DRIVER_FOLDERS[choice == DRIVER_AUTO ? autoDriver(context) : choice];
+        if (folder != null) {
+            for (String f : folder.split(",")) {
+                //noinspection ResultOfMethodCallIgnored
+                new File(context.getFilesDir(), "drivers/.failed_" + f).delete();
+            }
+        }
+    }
+
+    static int autoDriver(Context context) {
+        int generation = adrenoGeneration(context);
+        if (generation == 6 || generation == 7) return DRIVER_TURNIP;
+        if (generation == 8) return AUTO_8XX;
+        return DRIVER_SYSTEM;
+    }
+
+    static int effectiveDriver(Context context) {
+        int choice = driverChoice(context);
+        return choice == DRIVER_AUTO ? autoDriver(context) : choice;
+    }
+
+    static String driverLabel(Context context) {
+        int choice = driverChoice(context);
+        return choice == DRIVER_AUTO ? "Automatic (" + DRIVER_NAMES[autoDriver(context)] + ")" : DRIVER_NAMES[choice];
+    }
+
+    /** What the last launch actually ran on, as written by the game (custom_driver.cpp). */
+    static String lastDriver(Context context) {
+        File f = new File(context.getFilesDir(), "drivers/last_driver.txt");
+        try (BufferedReader reader = new BufferedReader(new FileReader(f))) {
+            String line = reader.readLine();
+            return line != null ? line.trim() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static void addDriverArguments(Context context, List<String> args) {
+        int driver = effectiveDriver(context);
+        if (DRIVER_FOLDERS[driver] == null) return;
+        args.add("--android_vulkan_driver=" + DRIVER_FOLDERS[driver]);
+        args.add("--android_vulkan_driver_lib=" + DRIVER_LIBS[driver]);
+        if (DRIVER_ENV[driver] != null) args.add("--android_vulkan_driver_env=" + DRIVER_ENV[driver]);
+    }
+
     static String[] buildArguments(Context context) {
         File root = root(context);
         // The CLI parser rejects a repeated non-boolean option, so later sources replace earlier ones.
@@ -214,6 +321,11 @@ final class LaunchConfig {
         // (the same choice the SDK's own ARM64 Linux launcher makes).
         defaults.add("--vulkan_sparse_shared_memory=false");
         defaults.add("--render_target_path_vulkan=fbo");
+        // Mali and PowerVR GPUs have no geometry shaders and no wireframe fill: the SDK has
+        // fallbacks for both (primitive expansion in the vertex shader, solid fill).
+        defaults.add("--vulkan_require_geometry_shader=false");
+        defaults.add("--vulkan_require_fill_mode_non_solid=false");
+        addDriverArguments(context, defaults);
         for (String flag : PERFORMANCE) {
             defaults.add(flag);
         }

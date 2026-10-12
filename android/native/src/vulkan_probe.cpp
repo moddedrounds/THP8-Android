@@ -128,9 +128,9 @@ std::string Probe() {
     Feature(out, "independentBlend", f.independentBlend, true);
     Feature(out, "fragmentStoresAndAtomics", f.fragmentStoresAndAtomics, true);
     Feature(out, "vertexPipelineStoresAndAtomics", f.vertexPipelineStoresAndAtomics, true);
-    Feature(out, "geometryShader", f.geometryShader, true);
-    Feature(out, "fillModeNonSolid", f.fillModeNonSolid, true);
-    out += "  Features it uses when present:\n";
+    out += "  Features it uses when present (fallback paths otherwise, e.g. Mali / PowerVR):\n";
+    Feature(out, "geometryShader", f.geometryShader, false);
+    Feature(out, "fillModeNonSolid", f.fillModeNonSolid, false);
     Feature(out, "fullDrawIndexUint32", f.fullDrawIndexUint32, false);
     Feature(out, "sampleRateShading", f.sampleRateShading, false);
     Feature(out, "shaderClipDistance", f.shaderClipDistance, false);
@@ -168,7 +168,7 @@ std::string Probe() {
     }
 
     const bool ok = f.independentBlend && f.fragmentStoresAndAtomics && f.vertexPipelineStoresAndAtomics &&
-                    f.geometryShader && f.fillModeNonSolid && HasExtension(extensions, "VK_KHR_swapchain");
+                    HasExtension(extensions, "VK_KHR_swapchain");
     out += ok ? "  VERDICT: has everything the SDK requires.\n"
               : "  VERDICT: MISSING a required feature - the game will refuse to start on this GPU.\n";
   }

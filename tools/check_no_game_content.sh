@@ -45,6 +45,11 @@ check_glob '*.img'      'a disc image is in the tree'
 check_glob 'DATA/*'     'the disc data directory is in the tree'
 check_glob '*/DATA/*'   'the disc data directory is in the tree'
 
+# Android release artefacts: a built APK carries the translated code; the signing key is private.
+check_glob '*.apk'       'a built APK is in the tree'
+check_glob '*.jks'       'a signing keystore is in the tree'
+check_glob '*.keystore'  'a signing keystore is in the tree'
+
 # The recompiler's output is a translation of the publisher's machine code.
 check_glob '*thps_p8_recomp.*.cpp' 'generated translation units are in the tree'
 check_glob '*/generated/*'         'recompiler output is in the tree'

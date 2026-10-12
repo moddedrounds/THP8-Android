@@ -49,6 +49,10 @@ REXCVAR_DEFINE_INT32(android_affinity_mode, 1, "Android",
                      "6 = like 5, but the GPU command processor moves to the prime core while it "
                      "needs more than android_cp_prime_up_pct of a mid core (heavy views) and back "
                      "when it needs less than android_cp_prime_down_pct of the prime core.");
+REXCVAR_DEFINE_BOOL(android_affinity_use_prime, false, "Android",
+                    "Modes 2 / 3 / 6 on chips with strong mid cores (>= 3.2 GHz, e.g. Snapdragon 8 "
+                    "Elite) still use the prime cores; by default those chips run as mode 5 "
+                    "(game off the prime cores: much cooler, and the mid cores keep up with 60 fps)");
 REXCVAR_DEFINE_BOOL(android_affinity_rerank_pin, false, "Android",
                     "Diagnostic: the old behaviour of modes 2 / 3, where re-ranking the hot threads "
                     "pinned the swapped threads to single cores")
@@ -91,35 +95,91 @@ namespace {
 
 struct Core {
   int index;
-  long max_khz;
+  long strength;  // cpu_capacity (the kernel's per-core performance, 1024 = fastest) or max clock
 };
 
-// Which cores are worth reserving for hot threads: those within 80% of the fastest one's clock.
-// On a Snapdragon 8 Gen 2 that is the X3 plus the four mid cores, leaving the three little ones.
+long ReadLong(const std::string& path) {
+  std::ifstream f(path);
+  long v = 0;
+  f >> v;
+  return v;
+}
+
+// Which cores are worth reserving for hot threads. Cores are grouped into clusters by the kernel's
+// cpu_capacity (it accounts for the core design, so a 2.0 GHz Cortex-A55 does not look like a
+// 2.2 GHz A76) or, without it, by maximum clock:
+// - three or more clusters: every cluster but the slowest (Snapdragon 8 Gen 2: the X3 plus the four
+//   mid cores; 8 Gen 3: 1 + 5; Dimensity 9300: 1 + 3; Tensor: 1 + 3/4),
+// - two clusters: the faster one, plus the slower one when it has at least 70% of its strength
+//   (Snapdragon 8 Elite: 2 primes + 6 performance cores, all of them; 4 x A78 + 4 x A55: the A78s),
+// - fewer than three cores worth reserving (2 x A76 + 6 x A55) or all cores alike: none, the
+//   scheduler places threads itself (pinning onto one or two cores serialises the game).
+// Order: strongest first; among equals the higher index first (the prime core is the highest-numbered).
+// Size of the fastest cluster (1 on a Snapdragon 8 Gen 2, 2 on an 8 Elite), and whether the next
+// cluster is strong on its own (>= 3.2 GHz).
+int g_prime_count = 1;
+bool g_strong_mids = false;
+
 std::vector<int> FindPerformanceCores(int* total_cores) {
   const int n = int(sysconf(_SC_NPROCESSORS_CONF));
   *total_cores = n;
   std::vector<Core> cores;
+  bool capacity = true;
   for (int i = 0; i < n; ++i) {
-    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
-    long khz = 0;
-    f >> khz;
-    cores.push_back({i, khz});
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(i);
+    long cap = ReadLong(base + "/cpu_capacity");
+    if (cap <= 0) capacity = false;
+    cores.push_back({i, cap});
   }
-  long best = 0;
-  for (const Core& c : cores) best = std::max(best, c.max_khz);
+  if (!capacity) {
+    for (Core& c : cores) c.strength = ReadLong("/sys/devices/system/cpu/cpu" + std::to_string(c.index) +
+                                                "/cpufreq/cpuinfo_max_freq");
+  }
+  std::vector<long> clusters;  // distinct strengths, strongest first
+  for (const Core& c : cores) {
+    if (c.strength > 0 && std::find(clusters.begin(), clusters.end(), c.strength) == clusters.end()) {
+      clusters.push_back(c.strength);
+    }
+  }
+  std::sort(clusters.rbegin(), clusters.rend());
+  if (clusters.size() < 2) return {};  // all cores alike: nothing to arrange
+  long floor;
+  if (clusters.size() >= 3) {
+    floor = clusters[clusters.size() - 2];
+  } else {
+    floor = clusters[1] * 10 >= clusters[0] * 7 ? clusters[1] : clusters[0];
+  }
   std::vector<Core> fast;
   for (const Core& c : cores) {
-    if (best > 0 && c.max_khz * 10 >= best * 8) fast.push_back(c);
+    if (c.strength >= floor) fast.push_back(c);
   }
-  // Fastest first; among equals the higher index first (the prime core is the highest-numbered).
   std::sort(fast.begin(), fast.end(), [](const Core& a, const Core& b) {
-    return a.max_khz != b.max_khz ? a.max_khz > b.max_khz : a.index > b.index;
+    return a.strength != b.strength ? a.strength > b.strength : a.index > b.index;
   });
   std::vector<int> out;
   for (const Core& c : fast) out.push_back(c.index);
-  if (int(out.size()) == n) out.clear();  // all cores alike: nothing to arrange
+  if (out.size() < 3) out.clear();
+  g_prime_count = 0;
+  for (const Core& c : fast) g_prime_count += c.strength == clusters[0] ? 1 : 0;
+  g_prime_count = std::max(1, std::min(g_prime_count, int(out.size()) - 1));
+  for (const Core& c : cores) {
+    if (c.strength == clusters[1]) {
+      g_strong_mids = ReadLong("/sys/devices/system/cpu/cpu" + std::to_string(c.index) +
+                               "/cpufreq/cpuinfo_max_freq") >= 3200000;
+      break;
+    }
+  }
   return out;
+}
+
+// The mode in effect: modes that put the command processor on the prime cores run as mode 5 when the
+// mid cores are strong enough on their own (android_affinity_use_prime restores them).
+int Mode() {
+  const int mode = REXCVAR_GET(android_affinity_mode);
+  if (g_strong_mids && !REXCVAR_GET(android_affinity_use_prime) && (mode == 2 || mode == 3 || mode == 6)) {
+    return 5;
+  }
+  return mode;
 }
 
 struct ThreadInfo {
@@ -314,7 +374,7 @@ class ManagerImpl : public Manager {
     auto last = std::chrono::steady_clock::now();
     // The cap on pinned threads leaves at least one performance core for everything else.
     const size_t max_pinned = performance_.size() > 1 ? performance_.size() - 1 : 1;
-    int mode = REXCVAR_GET(android_affinity_mode);
+    int mode = Mode();
 
     while (!stop_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -347,9 +407,9 @@ class ManagerImpl : public Manager {
       // The mode changed while running (in-game menu: 30 fps modes use 1, "up to 60" uses 2):
       // re-apply the pinned threads' masks; the rest are re-applied below.
       static bool prime_only = false;
-      if (REXCVAR_GET(android_affinity_mode) != mode ||
+      if (Mode() != mode ||
           REXCVAR_GET(android_cp_prime_only) != prime_only) {
-        mode = REXCVAR_GET(android_affinity_mode);
+        mode = Mode();
         prime_only = REXCVAR_GET(android_cp_prime_only);
         for (auto& [t, c] : pinned) {
           SetMask(t, mode >= 2 ? MaskMode2(threads[t].name) : mode == 1 ? performance_ : std::vector<int>{c});
@@ -412,8 +472,8 @@ class ManagerImpl : public Manager {
           for (auto& [t, c] : pinned) taken |= (c == core);
           if (taken) continue;
           pinned[tid] = core;
-          SetMask(tid, REXCVAR_GET(android_affinity_mode) >= 2 ? MaskMode2(threads[tid].name)
-                       : REXCVAR_GET(android_affinity_mode) == 1 ? performance_
+          SetMask(tid, Mode() >= 2 ? MaskMode2(threads[tid].name)
+                       : Mode() == 1 ? performance_
                                                                  : std::vector<int>{core});
           LOGI("pinned '%s' (tid %d, %.0f%%) to cpu%d", threads[tid].name.c_str(), tid, pct, core);
           break;
@@ -442,12 +502,12 @@ class ManagerImpl : public Manager {
               // processor and the main thread to one core each and swap them every round or two
               // (the CP spent half the time pinned to a mid core, the main thread to the prime core,
               // the reverse of what mode 2 is for); android_affinity_rerank_pin restores that.
-              if (REXCVAR_GET(android_affinity_mode) == 0 ||
-                  (REXCVAR_GET(android_affinity_rerank_pin) && REXCVAR_GET(android_affinity_mode) != 1 &&
-                   REXCVAR_GET(android_affinity_mode) < 5)) {
+              if (Mode() == 0 ||
+                  (REXCVAR_GET(android_affinity_rerank_pin) && Mode() != 1 &&
+                   Mode() < 5)) {
                 SetMask(ti, {cj});
                 SetMask(tj, {ci});
-              } else if (REXCVAR_GET(android_affinity_mode) >= 2 && REXCVAR_GET(android_affinity_mode) <= 4) {
+              } else if (Mode() >= 2 && Mode() <= 4) {
                 SetMask(ti, MaskMode2(threads[ti].name));
                 SetMask(tj, MaskMode2(threads[tj].name));
               }
@@ -509,12 +569,12 @@ class ManagerImpl : public Manager {
 
       // Everything else keeps off the cores reserved above.
       uint64_t reserved = 0;
-      if (REXCVAR_GET(android_affinity_mode) == 0) {
+      if (Mode() == 0) {
         for (auto& [t, c] : pinned) reserved |= (uint64_t(1) << c);
-      } else if (REXCVAR_GET(android_affinity_mode) == 4) {
+      } else if (Mode() == 4) {
         for (int c : performance_) reserved |= uint64_t(1) << c;
-      } else if (REXCVAR_GET(android_affinity_mode) >= 2 && !performance_.empty()) {
-        reserved = uint64_t(1) << performance_[0];
+      } else if (Mode() >= 2 && !performance_.empty()) {
+        for (int i = 0; i < g_prime_count; ++i) reserved |= uint64_t(1) << performance_[i];
       }
       std::vector<int> rest;
       for (int c = 0; c < total_; ++c) {
@@ -523,7 +583,7 @@ class ManagerImpl : public Manager {
       const uint64_t rest_mask = ~reserved;
       for (auto& [tid, info] : threads) {
         if (pinned.count(tid)) continue;
-        if (REXCVAR_GET(android_affinity_mode) == 4 && info.name.rfind("GPU VSync", 0) == 0) {
+        if (Mode() == 4 && info.name.rfind("GPU VSync", 0) == 0) {
           // Latency-critical even when not hot: keep it on the mid cores.
           if (applied_rest[tid] != 1) {
             SetMask(tid, MaskMode2(info.name));
@@ -531,7 +591,7 @@ class ManagerImpl : public Manager {
           }
           continue;
         }
-        if (REXCVAR_GET(android_affinity_mode) >= 2 && PrimeAllowed(info.name)) {
+        if (Mode() >= 2 && PrimeAllowed(info.name)) {
           // Not hot (yet): still allowed on the fastest core.
           if (applied_rest[tid] != ~uint64_t(0)) {
             SetMask(tid, performance_);
@@ -553,12 +613,12 @@ class ManagerImpl : public Manager {
   // Modes 2 / 3: the threads that may use the fastest core.
   static inline bool cp_on_prime_ = false;  // mode 6 state (manager thread only)
   static bool PrimeAllowed(const std::string& name) {
-    if (REXCVAR_GET(android_affinity_mode) == 5) return false;
-    if (REXCVAR_GET(android_affinity_mode) == 6) {
+    if (Mode() == 5) return false;
+    if (Mode() == 6) {
       return cp_on_prime_ && name.rfind("GPU Commands", 0) == 0;
     }
     return name.rfind("GPU Commands", 0) == 0 ||
-           (REXCVAR_GET(android_affinity_mode) == 3 && name.rfind("GPU VSync", 0) == 0);
+           (Mode() == 3 && name.rfind("GPU VSync", 0) == 0);
   }
   std::vector<int> MaskMode2(const std::string& name) const {
     if (REXCVAR_GET(android_cp_prime_only) && !performance_.empty() &&
@@ -566,7 +626,7 @@ class ManagerImpl : public Manager {
       return {performance_[0]};
     }
     if (PrimeAllowed(name) || performance_.size() < 2) return performance_;
-    return std::vector<int>(performance_.begin() + 1, performance_.end());
+    return std::vector<int>(performance_.begin() + g_prime_count, performance_.end());
   }
 
   std::vector<int> All() const {
@@ -577,6 +637,26 @@ class ManagerImpl : public Manager {
 
   std::vector<int> performance_;
   int total_;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
+// No core placement on this device, but files/live_cvars.txt is still read once a second.
+class LiveOnly final : public Manager {
+ public:
+  LiveOnly() : thread_([this] {
+    pthread_setname_np(pthread_self(), "live settings");
+    while (!stop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      thps::live::PollFile();
+    }
+  }) {}
+  ~LiveOnly() override {
+    stop_ = true;
+    thread_.join();
+  }
+
+ private:
   std::atomic<bool> stop_{false};
   std::thread thread_;
 };
@@ -605,12 +685,13 @@ std::unique_ptr<Manager> Start() {
   int total = 0;
   std::vector<int> performance = FindPerformanceCores(&total);
   if (performance.empty()) {
-    LOGI("all cores look alike; not managing affinity");
-    return nullptr;
+    LOGI("no group of three or more faster cores; not managing affinity");
+    return std::make_unique<LiveOnly>();
   }
   std::string list;
   for (int c : performance) list += " cpu" + std::to_string(c);
-  LOGI("managing affinity: %d cores, performance cores in priority order:%s", total, list.c_str());
+  LOGI("managing affinity: %d cores, performance cores in priority order:%s (prime cluster %d, "
+       "strong mid cores %s)", total, list.c_str(), g_prime_count, g_strong_mids ? "yes" : "no");
   return std::make_unique<ManagerImpl>(std::move(performance), total);
 }
 

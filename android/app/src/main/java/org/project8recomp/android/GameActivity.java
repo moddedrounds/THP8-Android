@@ -66,6 +66,9 @@ public class GameActivity extends SDLActivity {
                             }
                         }
                         android.util.Log.i("thps8", "bundled driver file copied: " + out);
+                        // A new copy of a driver gets another chance after earlier failures.
+                        //noinspection ResultOfMethodCallIgnored
+                        new java.io.File(getFilesDir(), "drivers/.failed_" + name).delete();
                     }
                 }
             }
@@ -98,6 +101,8 @@ public class GameActivity extends SDLActivity {
                             }
                         }
                         android.util.Log.i("thps8", "driver file copied: " + out);
+                        //noinspection ResultOfMethodCallIgnored
+                        new java.io.File(getFilesDir(), "drivers/.failed_" + folder.getName()).delete();
                     }
                 }
             }

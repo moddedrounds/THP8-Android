@@ -1,0 +1,27 @@
+name: Device report
+description: Tell us how the port runs on your phone or handheld
+labels: [device-report]
+body:
+  - type: input
+    id: device
+    attributes: {label: Device, description: "Phone / handheld model, e.g. Galaxy S24 (Exynos 2400)"}
+    validations: {required: true}
+  - type: input
+    id: android
+    attributes: {label: Android version}
+    validations: {required: true}
+  - type: textarea
+    id: launcher
+    attributes:
+      label: Launcher info
+      description: Copy the "GPU", "Graphics driver" and "Vulkan probe" lines from the launcher's info panel.
+    validations: {required: true}
+  - type: dropdown
+    id: result
+    attributes:
+      label: What happened?
+      options: ["Plays well", "Plays, but slow / stutters", "Graphics glitches", "Crashes or black screen", "Does not start"]
+    validations: {required: true}
+  - type: textarea
+    id: details
+    attributes: {label: Details, description: "Settings used (frame rate, resolution, driver), fps, screenshots. No game files or ISO links."}

@@ -1,0 +1,117 @@
+diff --git a/include/rex/ui/flags.h b/include/rex/ui/flags.h
+index fa2ef60..1b056b8 100644
+--- a/include/rex/ui/flags.h
++++ b/include/rex/ui/flags.h
+@@ -62,4 +62,5 @@ REXCVAR_DECLARE(bool, vulkan_require_geometry_shader);
+ REXCVAR_DECLARE(bool, vulkan_require_fragment_stores_and_atomics);
+ REXCVAR_DECLARE(bool, vulkan_require_vertex_pipeline_stores_and_atomics);
+ REXCVAR_DECLARE(bool, vulkan_require_fill_mode_non_solid);
++REXCVAR_DECLARE(std::string, vulkan_mask_features);
+ #endif  // REX_HAS_VULKAN
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 79f3b82..d308ea6 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -31,6 +31,7 @@
+ #include <rex/graphics/vulkan/texture_cache.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/ui/flags.h>
+ #include <rex/ui/vulkan/mem_alloc.h>
+ #include <rex/ui/vulkan/ui_samplers.h>
+ #include <rex/ui/vulkan/util.h>
+@@ -2559,7 +2560,10 @@ bool VulkanTextureCache::Initialize() {
+       host_format.unsigned_signed_compatible = false;
+     }
+   }
+-  // S3TC.
++  // S3TC. vulkan_mask_features=textureCompressionBC takes the decompression fallbacks (as
++  // on Mali / PowerVR, which have no BC formats).
++  const bool mask_bc =
++      REXCVAR_GET(vulkan_mask_features).find("textureCompressionBC") != std::string::npos;
+   // Not checking the textureCompressionBC feature because its availability
+   // means that all BC formats are supported, however, the device may expose
+   // some BC formats without this feature. Xenia doesn't use BC6H and BC7 at
+@@ -2587,6 +2591,7 @@ bool VulkanTextureCache::Initialize() {
+   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                                           &format_properties);
++  if (mask_bc) format_properties.optimalTilingFeatures = 0;
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+     log_bc_fallback("k_DXT1", VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                     format_properties.optimalTilingFeatures);
+@@ -2599,6 +2604,7 @@ bool VulkanTextureCache::Initialize() {
+   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
+                                           &format_properties);
++  if (mask_bc) format_properties.optimalTilingFeatures = 0;
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+     log_bc_fallback("k_DXT2_3", VK_FORMAT_BC2_UNORM_BLOCK,
+                     format_properties.optimalTilingFeatures);
+@@ -2611,6 +2617,7 @@ bool VulkanTextureCache::Initialize() {
+   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
+                                           &format_properties);
++  if (mask_bc) format_properties.optimalTilingFeatures = 0;
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+     log_bc_fallback("k_DXT4_5", VK_FORMAT_BC3_UNORM_BLOCK,
+                     format_properties.optimalTilingFeatures);
+@@ -2623,6 +2630,7 @@ bool VulkanTextureCache::Initialize() {
+   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_UNORM_BLOCK,
+                                           &format_properties);
++  if (mask_bc) format_properties.optimalTilingFeatures = 0;
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+     log_bc_fallback("k_DXN", VK_FORMAT_BC5_UNORM_BLOCK,
+                     format_properties.optimalTilingFeatures);
+@@ -2634,6 +2642,7 @@ bool VulkanTextureCache::Initialize() {
+   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
+                                           &format_properties);
++  if (mask_bc) format_properties.optimalTilingFeatures = 0;
+   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+     log_bc_fallback("k_DXT5A", VK_FORMAT_BC4_UNORM_BLOCK,
+                     format_properties.optimalTilingFeatures);
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 2b661c5..c413dda 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -41,6 +41,12 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
+                     "allow fallback to solid fill for line/point polygon modes)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(vulkan_mask_features, "", "UI/Vulkan",
++                      "Testing: comma-separated device features to treat as unsupported, so a GPU "
++                      "that has them runs the fallback paths of GPUs that do not (e.g. "
++                      "geometryShader,fillModeNonSolid,textureCompressionBC as on Mali / PowerVR)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -91,6 +97,25 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   VkPhysicalDeviceFeatures supported_features = {};
+   ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
++  {
++    const std::string& mask = REXCVAR_GET(vulkan_mask_features);
++#define XE_UI_VULKAN_MASK(name)                                           \
++  if (mask.find(#name) != std::string::npos && supported_features.name) { \
++    supported_features.name = VK_FALSE;                                   \
++    REXLOG_WARN("Vulkan feature " #name " masked by vulkan_mask_features"); \
++  }
++    XE_UI_VULKAN_MASK(geometryShader)
++    XE_UI_VULKAN_MASK(fillModeNonSolid)
++    XE_UI_VULKAN_MASK(tessellationShader)
++    XE_UI_VULKAN_MASK(sampleRateShading)
++    XE_UI_VULKAN_MASK(depthClamp)
++    XE_UI_VULKAN_MASK(shaderClipDistance)
++    XE_UI_VULKAN_MASK(shaderCullDistance)
++    XE_UI_VULKAN_MASK(samplerAnisotropy)
++    XE_UI_VULKAN_MASK(fullDrawIndexUint32)
++    XE_UI_VULKAN_MASK(occlusionQueryPrecise)
++#undef XE_UI_VULKAN_MASK
++  }
+ 
+   if (with_gpu_emulation) {
+     if (!supported_features.independentBlend) {

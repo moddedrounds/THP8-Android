@@ -40,6 +40,7 @@ public class LauncherActivity extends Activity {
     private Button frameGenButton;
     private Button upscalerButton;
     private Button showFpsButton;
+    private Button driverButton;
     private Button installButton;
     private TextView installStatus;
     private volatile boolean installing;
@@ -49,7 +50,9 @@ public class LauncherActivity extends Activity {
 
     private static final int PICK_ISO = 1;
     // SHA-256 of the supported release's default.xex. The installer refuses any other executable.
-    static final String[] ACCEPTED_XEX_SHA256 = {"cfc732340e55defda400e25f03231aa9bb65fd9545b618212f69a4952384a5dd"};
+    private String[] acceptedXexSha256() {
+        return getString(getResources().getIdentifier("accepted_xex_sha256", "string", getPackageName())).split(",");
+    }
 
     private void nextRenderScale() {
         int current = LaunchConfig.renderScale(this);
@@ -71,6 +74,7 @@ public class LauncherActivity extends Activity {
         upscalerButton.setText("Upscaler: " + (LaunchConfig.fsr(this) ? "FSR 1" : "bilinear"));
         int mode = LaunchConfig.fpsMode(this);
         frameGenButton.setText("Frame rate: " + LaunchConfig.FPS_MODES[Math.max(0, Math.min(mode, LaunchConfig.FPS_MODES.length - 1))]);
+        driverButton.setText("Graphics driver: " + LaunchConfig.driverLabel(this));
         showFpsButton.setText("Show FPS: " + (LaunchConfig.showFps(this) ? "on" : "off"));
     }
 
@@ -121,6 +125,7 @@ public class LauncherActivity extends Activity {
         playButton = button("Play", v -> startGame());
         Button probe = button("Run Vulkan probe", v -> runProbe());
         Button refresh = button("Refresh", v -> refresh());
+        Button licenses = button("Licenses", v -> showLicenses());
         installButton = button("Select my Project 8 ISO", v -> pickIso());
         buttons.addView(playButton);
         buttons.addView(installButton);
@@ -130,6 +135,7 @@ public class LauncherActivity extends Activity {
         }
         buttons.addView(probe);
         buttons.addView(refresh);
+        buttons.addView(licenses);
         root.addView(buttons);
 
         LinearLayout options = new LinearLayout(this);
@@ -151,7 +157,16 @@ public class LauncherActivity extends Activity {
         });
         options.addView(frameGenButton);
         options.addView(showFpsButton);
-        root.addView(options);
+        driverButton = button("", v -> {
+            LaunchConfig.setDriverChoice(this, (LaunchConfig.driverChoice(this) + 1) % LaunchConfig.DRIVER_NAMES.length);
+            updateOptionLabels();
+            refresh();
+        });
+        options.addView(driverButton);
+        // Scrolls sideways when the row is wider than the screen.
+        android.widget.HorizontalScrollView optionsScroll = new android.widget.HorizontalScrollView(this);
+        optionsScroll.addView(options);
+        root.addView(optionsScroll);
         updateOptionLabels();
 
         ScrollView scroll = new ScrollView(this);
@@ -240,7 +255,7 @@ public class LauncherActivity extends Activity {
             boolean ok;
             final long[] lastUi = {0};
             try {
-                result = IsoInstaller.install(this, uri, LaunchConfig.gameDataRoot(this), ACCEPTED_XEX_SHA256,
+                result = IsoInstaller.install(this, uri, LaunchConfig.gameDataRoot(this), acceptedXexSha256(),
                         (done, total, file) -> {
                             long now = System.currentTimeMillis();
                             if (now - lastUi[0] < 250) return;
@@ -344,6 +359,31 @@ public class LauncherActivity extends Activity {
         }, "update-download").start();
     }
 
+    private void showLicenses() {
+        String text;
+        try (java.io.InputStream in = getAssets().open("NOTICE.txt")) {
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[16384];
+            int n;
+            while ((n = in.read(b)) > 0) bo.write(b, 0, n);
+            text = bo.toString("UTF-8");
+        } catch (IOException e) {
+            text = "NOTICE.txt is missing from this build.";
+        }
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTypeface(Typeface.MONOSPACE);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        t.setPadding(dp(12), dp(12), dp(12), dp(12));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(t);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Third-party licences")
+                .setView(sv)
+                .setPositiveButton("Close", null)
+                .show();
+    }
+
     private void updateInstallLabels() {
         installButton.setText(gameInstalled() ? "Reinstall from ISO" : "Select my Project 8 ISO");
         if (!gameInstalled() && !installing && installStatus.getText().length() == 0) {
@@ -376,6 +416,15 @@ public class LauncherActivity extends Activity {
 
     private void refresh() {
         StringBuilder sb = new StringBuilder();
+        android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        if (power != null && power.isPowerSaveMode()) {
+            sb.append("WARNING: Battery saver / Power saving is ON - it caps the CPU and GPU and the game\n"
+                    + "runs 2-3x slower. Turn it off in the quick settings before playing.\n\n");
+        }
+        if (power != null && Build.VERSION.SDK_INT >= 29
+                && power.getCurrentThermalStatus() >= android.os.PowerManager.THERMAL_STATUS_MODERATE) {
+            sb.append("WARNING: the phone is hot and slowing itself down; let it cool for best performance.\n\n");
+        }
         sb.append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL);
         if (Build.VERSION.SDK_INT >= 31) {
             sb.append("  (SoC ").append(Build.SOC_MODEL).append(')');
@@ -383,6 +432,11 @@ public class LauncherActivity extends Activity {
         sb.append("\nAndroid ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT)
                 .append("), ABIs ").append(String.join(",", Build.SUPPORTED_ABIS)).append('\n');
         Display display = getWindowManager().getDefaultDisplay();
+        sb.append("GPU: ").append(LaunchConfig.gpuName(this)).append("\nGraphics driver: ")
+                .append(LaunchConfig.driverLabel(this));
+        String lastDriver = LaunchConfig.lastDriver(this);
+        if (!lastDriver.isEmpty()) sb.append("; last launch used: ").append(lastDriver);
+        sb.append('\n');
         sb.append(String.format(Locale.US, "Display: %.0f Hz\n", display.getRefreshRate()));
 
         sb.append("App version: ").append(UpdateChecker.installedVersionName(this))

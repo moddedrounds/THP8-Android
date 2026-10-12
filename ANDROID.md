@@ -26,7 +26,28 @@ Updates: the app checks for new versions itself (or tap **Check for updates**); 
 verifies and installs them, keeping your installed game and saves.
 
 Requirements: Android 10 or newer, ARM64, Vulkan, and about 6 GB free in addition to the ISO.
-Tested on the AYN Thor (Snapdragon 8 Gen 2); a controller is recommended. Other devices are untested.
+Tested on the AYN Thor (Snapdragon 8 Gen 2) and a Galaxy S25 Ultra (Snapdragon 8 Elite); a
+controller is recommended. See *Which phones work* below.
+
+## Which phones work (v1.2.0)
+
+| GPU (chip) | Graphics driver the app picks | Status |
+|---|---|---|
+| Adreno 6xx / 7xx (Snapdragon 855 ... 8 Gen 3, 7-series) | Mesa Turnip (bundled) | Tested: AYN Thor (8 Gen 2), 60 fps |
+| Adreno 8xx (Snapdragon 8 Elite) | Mesa Turnip for Adreno 8xx (bundled, experimental) | Tested: Galaxy S25 Ultra, 30-60 fps, throttles when hot |
+| Mali / PowerVR / Xclipse (Exynos, MediaTek Dimensity, Google Tensor) | the phone's own driver | Untested - please report |
+
+- The launcher's **Graphics driver** button switches between *Automatic*, *Phone's own*, *Turnip* and
+  *Turnip 8xx*. Before using a bundled driver the game checks that it finds your GPU; if not, it uses
+  the phone's own driver automatically. The launcher shows which driver the last launch used.
+- The phone's own Adreno driver draws a blue haze / flickering textures in these games; that is why
+  Turnip is the default on Snapdragon.
+- **Phones throttle when hot.** Turn **Power saving / Battery saver off** (the launcher warns you when
+  it is on: it halves performance), keep the phone cool, and lower **Resolution** if frames drop
+  after a few minutes. New installs start at 85 % on Adreno 7xx/8xx phones, 75 % on other phones and
+  100 % on handhelds with a fan (AYN, Retroid, Ayaneo, Anbernic); FSR 1 scales the picture back up.
+- **Your phone isn't listed?** Open an issue with the *Device report* form: phone model, chip,
+  Android version, the launcher's GPU / driver lines, and what happened. That is how the list grows.
 
 ## Legal: bring your own game
 

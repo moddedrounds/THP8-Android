@@ -32,6 +32,12 @@ android {
         ndk { abiFilters += "arm64-v8a" }
         // In-app update checks read this update.json; empty (the default) = no checks (dev builds).
         resValue("string", "update_manifest_url", (findProperty("app.updateUrl") as String?) ?: "")
+        // The ISO installer accepts exactly the releases in src/common/supported_dumps.h, the table the
+        // launcher and the game's own gate share upstream: read it rather than keep a copy.
+        val dumps = rootProject.projectDir.parentFile.resolve("src/common/supported_dumps.h").readText()
+        val accepted = Regex("\"([0-9a-f]{64})\"").findAll(dumps).map { it.groupValues[1] }.toList()
+        check(accepted.isNotEmpty()) { "no SHA-256 rows found in src/common/supported_dumps.h" }
+        resValue("string", "accepted_xex_sha256", accepted.joinToString(","))
         manifestPlaceholders["appIcon"] =
             if (hasArt) "@mipmap/ic_launcher" else "@android:drawable/sym_def_app_icon"
     }
@@ -73,6 +79,8 @@ android {
         getByName("main") {
             java.srcDir(sdkTree.resolve("thirdparty/sdl3/android-project/app/src/main/java"))
             if (hasArt) res.srcDir(artRes)
+            // Third-party licence notices (android/licenses/NOTICE.txt), shown by the launcher.
+            assets.srcDir(rootProject.projectDir.resolve("licenses"))
         }
     }
 
