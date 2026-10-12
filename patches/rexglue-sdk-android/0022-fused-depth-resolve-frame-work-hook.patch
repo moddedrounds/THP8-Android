@@ -1,0 +1,192 @@
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index aca4337..dcb08af 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -867,9 +867,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+                                             bool draw_resolution_scaled);
+   // Fused resolve shader kinds: the fast 32bpp copy, the full 32bpp copy (format conversion,
+   // sample averaging), and the lean 8_8_8_8 -> 8_8_8_8 one (the common full case).
+-  enum FusedResolveKind : uint32_t { kFusedResolveFast, kFusedResolveFull, kFusedResolve8888 };
++  enum FusedResolveKind : uint32_t {
++    kFusedResolveFast,
++    kFusedResolveFull,
++    kFusedResolve8888,
++    kFusedResolveFastDepth,  // D24S8 depth render target, fast copy
++  };
+   VkPipeline GetFusedResolvePipeline(FusedResolveKind kind, bool msaa);
+-  VkPipeline fused_resolve_pipelines_[3][2] = {};
++  VkPipeline fused_resolve_pipelines_[4][2] = {};
+   FusedResolveKind fused_resolve_kind_ = kFusedResolveFast;
+   uint64_t fused_resolve_count_ = 0, fused_resolve_fallback_count_ = 0;
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index cb4e447..c8d2c4c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -166,6 +166,11 @@ void NoteGuestVblank() {
+ }
+ 
+ // Run-queue delay of the calling thread so far (schedstat field 2, ns).
++// Called on the command processor thread at every swap with the command processor's CPU time and
++// run-queue wait for the frame and the frame period target (Android reports them to the platform's
++// performance hints). Set through rex_gpu_set_frame_work_hook (exported for the app).
++void (*g_frame_work_hook)(uint64_t cpu_ns, uint64_t runq_ns, uint64_t target_ns) = nullptr;
++
+ uint64_t ThreadRunqNs() {
+   uint64_t run = 0, wait = 0;
+   if (FILE* f = std::fopen("/proc/thread-self/schedstat", "r")) {
+@@ -1485,9 +1490,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+     rex::perf::SetCounter(rex::perf::CounterId::kSwapTimeUs,
+                           int64_t(now_ts.tv_sec) * 1000000 + now_ts.tv_nsec / 1000);
+   }
++  uint64_t frame_runq_ns = 0, frame_cpu_ns = 0;
+   {
+     static uint64_t last_runq = ThreadRunqNs();
+     const uint64_t runq = ThreadRunqNs();
++    frame_runq_ns = runq - last_runq;
+     rex::perf::SetCounter(rex::perf::CounterId::kCpRunqUs, int64_t((runq - last_runq) / 1000));
+     last_runq = runq;
+     rex::perf::SetCounter(rex::perf::CounterId::kVsyncRunqUs,
+@@ -1496,9 +1503,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   {
+     static uint32_t last_cpu_tenths = ThreadCpuTenthsMs();
+     const uint32_t cpu_tenths = ThreadCpuTenthsMs();
++    frame_cpu_ns = uint64_t(cpu_tenths - last_cpu_tenths) * 100000;
+     rex::perf::SetCounter(rex::perf::CounterId::kCpCpuUs, int64_t(cpu_tenths - last_cpu_tenths) * 100);
+     last_cpu_tenths = cpu_tenths;
+   }
++  if (g_frame_work_hook) {
++    const uint32_t cap = REXCVAR_GET(gpu_swap_fps_cap);
++    g_frame_work_hook(frame_cpu_ns, frame_runq_ns, 1000000000ull / (cap ? cap : 60));
++  }
+   {
+     static uint32_t swaps = 0;
+     static auto last_swap = std::chrono::steady_clock::now();
+@@ -2299,3 +2311,8 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+ }
+ 
+ }  // namespace rex::graphics
++
++extern "C" __attribute__((visibility("default"))) void rex_gpu_set_frame_work_hook(
++    void (*hook)(uint64_t cpu_ns, uint64_t runq_ns, uint64_t target_ns)) {
++  rex::graphics::g_frame_work_hook = hook;
++}
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 8b29284..1a4ac40 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1332,9 +1332,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 fused_resolve_kind_, fused_key.msaa_samples != xenos::MsaaSamples::k1X));
+             VkDescriptorSet fused_sets[] = {descriptor_set_dest,
+                                             fused_rt->GetDescriptorSetTransferSource()};
+-            command_buffer.CmdVkBindDescriptorSets(
+-                VK_PIPELINE_BIND_POINT_COMPUTE, direct_resolve_pipeline_layout_color_, 0,
+-                uint32_t(rex::countof(fused_sets)), fused_sets, 0, nullptr);
++            const VkPipelineLayout fused_layout = fused_key.is_depth
++                                                      ? direct_resolve_pipeline_layout_depth_
++                                                      : direct_resolve_pipeline_layout_color_;
++            command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, fused_layout, 0,
++                                                   uint32_t(rex::countof(fused_sets)), fused_sets,
++                                                   0, nullptr);
+             DirectResolvePushConstants fused_constants;
+             fused_constants.resolve = copy_shader_constants;
+             fused_constants.source_base_tiles = fused_key.base_tiles;
+@@ -1343,8 +1346,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_) |
+                 (draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_attachments_supported_)
+                  << 2);
+-            command_buffer.CmdVkPushConstants(direct_resolve_pipeline_layout_color_,
+-                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
++            command_buffer.CmdVkPushConstants(fused_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                               sizeof(fused_constants), &fused_constants);
+           } else {
+           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+@@ -6058,8 +6060,9 @@ VulkanRenderTargetCache::GetFusedResolveSource(
+   static uint64_t fallback_reasons[5] = {};
+   uint32_t fallback_reason = 0;
+   const bool full_copy = copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
++  const bool depth_copy = resolve_info.IsCopyingDepth();
+   if ((copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA || full_copy) &&
+-      !draw_resolution_scaled && !resolve_info.IsCopyingDepth() &&
++      !draw_resolution_scaled && (!depth_copy || !full_copy) &&
+       direct_resolve_pipeline_layout_color_ != VK_NULL_HANDLE) {
+     fallback_reason = 2;
+     uint32_t span_base, span_row_length, span_rows, span_pitch;
+@@ -6070,17 +6073,17 @@ VulkanRenderTargetCache::GetFusedResolveSource(
+       const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
+       auto* rt = static_cast<VulkanRenderTarget*>(rectangle.render_target);
+       const RenderTargetKey rt_key = rt->key();
+-      fallback_reason = (rt_key.is_depth ||
+-                         rt_key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+-                         rt_key.msaa_samples > xenos::MsaaSamples::k2X)
+-                            ? 3
+-                            : 4;
+-      if (!rt_key.is_depth &&
+-          rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+-          rt_key.msaa_samples <= xenos::MsaaSamples::k2X && rectangle.row_first == 0 &&
++      const bool format_supported =
++          rt_key.is_depth == depth_copy &&
++          (depth_copy
++               ? rt_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24S8
++               : rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8) &&
++          rt_key.msaa_samples <= xenos::MsaaSamples::k2X;
++      fallback_reason = format_supported ? 4 : 3;
++      if (format_supported && rectangle.row_first == 0 &&
+           rectangle.rows == span_rows && rectangle.row_first_start == 0 &&
+           rectangle.row_last_end == span_row_length) {
+-        fused_resolve_kind_ = kFusedResolveFast;
++        fused_resolve_kind_ = depth_copy ? kFusedResolveFastDepth : kFusedResolveFast;
+         if (full_copy) {
+           // The lean shader: 8_8_8_8 destination, and a sample selection it implements.
+           const uint32_t dest_format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+@@ -6102,7 +6105,10 @@ VulkanRenderTargetCache::GetFusedResolveSource(
+                                   rt_key.msaa_samples != xenos::MsaaSamples::k1X) !=
+               VK_NULL_HANDLE) {
+         command_processor_.PushImageMemoryBarrier(
+-            rt->image(), ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++            rt->image(),
++            ui::vulkan::util::InitializeSubresourceRange(
++                depth_copy ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
++                           : VK_IMAGE_ASPECT_COLOR_BIT),
+             rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+             rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, rt->current_layout(),
+             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -6112,7 +6118,7 @@ VulkanRenderTargetCache::GetFusedResolveSource(
+       }
+     }
+   }
+-  if (!result && resolve_info.IsCopyingDepth() && fallback_reason == 0) {
++  if (!result && depth_copy && fallback_reason == 0) {
+     fallback_reason = 1;
+   }
+   ++(result ? fused_resolve_count_ : fused_resolve_fallback_count_);
+@@ -6137,7 +6143,7 @@ VulkanRenderTargetCache::GetFusedResolveSource(
+ VkPipeline VulkanRenderTargetCache::GetFusedResolvePipeline(FusedResolveKind kind, bool msaa) {
+   VkPipeline& pipeline = fused_resolve_pipelines_[kind][msaa ? 1 : 0];
+   if (pipeline == VK_NULL_HANDLE) {
+-    static const std::pair<const uint32_t*, size_t> kCode[3][2] = {
++    static const std::pair<const uint32_t*, size_t> kCode[4][2] = {
+         {{shaders::direct_resolve_fast_32bpp_msaa0_cs,
+           sizeof(shaders::direct_resolve_fast_32bpp_msaa0_cs)},
+          {shaders::direct_resolve_fast_32bpp_msaa1_cs,
+@@ -6148,11 +6154,17 @@ VkPipeline VulkanRenderTargetCache::GetFusedResolvePipeline(FusedResolveKind kin
+           sizeof(shaders::direct_resolve_full_32bpp_msaa1_cs)}},
+         {{shaders::direct_resolve_8888_msaa0_cs, sizeof(shaders::direct_resolve_8888_msaa0_cs)},
+          {shaders::direct_resolve_8888_msaa1_cs, sizeof(shaders::direct_resolve_8888_msaa1_cs)}},
++        {{shaders::direct_resolve_fast_depth_msaa0_cs,
++          sizeof(shaders::direct_resolve_fast_depth_msaa0_cs)},
++         {shaders::direct_resolve_fast_depth_msaa1_cs,
++          sizeof(shaders::direct_resolve_fast_depth_msaa1_cs)}},
+     };
+     const auto& code = kCode[kind][msaa ? 1 : 0];
+-    pipeline = ui::vulkan::util::CreateComputePipeline(command_processor_.GetVulkanDevice(),
+-                                                       direct_resolve_pipeline_layout_color_,
+-                                                       code.first, code.second);
++    pipeline = ui::vulkan::util::CreateComputePipeline(
++        command_processor_.GetVulkanDevice(),
++        kind == kFusedResolveFastDepth ? direct_resolve_pipeline_layout_depth_
++                                       : direct_resolve_pipeline_layout_color_,
++        code.first, code.second);
+     if (pipeline == VK_NULL_HANDLE) {
+       REXGPU_ERROR("VulkanRenderTargetCache: failed to create the fused resolve pipeline");
+     }

@@ -1,0 +1,15 @@
+#version 450
+// Quarter-resolution luma of the current frame (4x4 box via 4 bilinear taps).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform PC { ivec4 a; vec4 b; } pc;  // a.xy dst size, b.xy 1/src size
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, pc.a.xy))) return;
+  vec2 uv = (vec2(p) + 0.5) / vec2(pc.a.xy);
+  vec2 t = pc.b.xy;
+  vec3 c = texture(src, uv + t * vec2(-1.0, -1.0)).rgb + texture(src, uv + t * vec2(1.0, -1.0)).rgb +
+           texture(src, uv + t * vec2(-1.0, 1.0)).rgb + texture(src, uv + t * vec2(1.0, 1.0)).rgb;
+  imageStore(dst, p, vec4(dot(c * 0.25, vec3(0.299, 0.587, 0.114))));
+}

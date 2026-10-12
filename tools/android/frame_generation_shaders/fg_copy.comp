@@ -1,0 +1,22 @@
+#version 450
+// prev = cur (kept for the next frame's interpolation), and the per-pixel still count: how many
+// real frame pairs in a row (0..2) left the pixel unchanged - static HUD / menu pixels.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 3, rgba16f) uniform image2D dst;
+layout(set = 0, binding = 4, rgba16f) uniform image2D still;
+layout(push_constant) uniform PC { ivec4 a; vec4 b; } pc;  // a.xy size, b.xy 1/size, b.z prev valid
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, pc.a.xy))) return;
+  vec3 c = texture(src, (vec2(p) + 0.5) * pc.b.xy).rgb;
+  float age = 0.0;
+  if (pc.b.z > 0.5) {
+    vec3 d = abs(c - imageLoad(dst, p).rgb);
+    if (max(d.r, max(d.g, d.b)) < 1.5 / 255.0) {
+      age = min(imageLoad(still, p).r + 1.0, 2.0);
+    }
+  }
+  imageStore(still, p, vec4(age));
+  imageStore(dst, p, vec4(c, 1.0));
+}

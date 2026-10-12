@@ -1,0 +1,45 @@
+#version 450
+// Block matching on quarter-res luma: one invocation per 4x4 luma block (16x16 output pixels).
+// The search is centred on the block's vector from the previous frame (camera motion is coherent,
+// and it keeps periodic structures such as fences locked to the right period); zero motion is always
+// tested too. Writes the motion prev->cur in output pixels.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D luma_prev;
+layout(set = 0, binding = 1) uniform sampler2D luma_cur;
+layout(set = 0, binding = 2) uniform sampler2D mv_last;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform PC { ivec4 a; vec4 b; } pc;  // a.xy blocks, a.zw luma size, b.x lambda, b.y radius, b.z predictor valid
+float cur_px[16];
+float Sad(ivec2 base, ivec2 d, ivec2 lim) {
+  float s = 0.0;
+  for (int i = 0; i < 16; ++i) {
+    s += abs(cur_px[i] - texelFetch(luma_prev, clamp(base + ivec2(i & 3, i >> 2) + d, ivec2(0), lim), 0).r);
+  }
+  return s;
+}
+void main() {
+  ivec2 blk = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(blk, pc.a.xy))) return;
+  ivec2 base = blk * 4;
+  ivec2 lim = pc.a.zw - 1;
+  for (int i = 0; i < 16; ++i) {
+    cur_px[i] = texelFetch(luma_cur, clamp(base + ivec2(i & 3, i >> 2), ivec2(0), lim), 0).r;
+  }
+  // Predicted displacement (luma texels, cur -> prev) from last frame's vector.
+  vec2 pred = pc.b.z > 0.5 ? -texelFetch(mv_last, blk, 0).xy * 0.25 : vec2(0.0);
+  ivec2 centre = ivec2(round(clamp(pred, vec2(-24.0), vec2(24.0))));
+  int r = int(pc.b.y);
+  float best = Sad(base, ivec2(0), lim) + pc.b.x * (abs(pred.x) + abs(pred.y)) * 0.5;
+  ivec2 bestd = ivec2(0);
+  for (int dy = -r; dy <= r; ++dy) {
+    for (int dx = -r; dx <= r; ++dx) {
+      ivec2 d = centre + ivec2(dx, dy);
+      float s = Sad(base, d, lim) + pc.b.x * (abs(float(d.x) - pred.x) + abs(float(d.y) - pred.y));
+      if (s < best) {
+        best = s;
+        bestd = d;
+      }
+    }
+  }
+  imageStore(mv_out, blk, vec4(-vec2(bestd) * 4.0, best / 16.0, 0.0));
+}

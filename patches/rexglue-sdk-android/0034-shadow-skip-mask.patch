@@ -1,0 +1,27 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9928549..3b9c7ba 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -99,6 +99,12 @@ REXCVAR_DEFINE_INT32(gpu_shadow_skip_level, 0, "GPU/Vulkan",
+                      "(staggered); 3 = every 16th. Skipped passes keep last update's contents. Live "
+                      "flags 8192 / 16384 force level 1 / 2.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_shadow_skip_mask, 2, "GPU/Vulkan",
++                     "gpu_shadow_skip_level applies to: bit 0 = the 1024 shadow target, bit 1 = the "
++                     "512 one. Default 2: the 1024 target carries the skater's own sun shadow, which "
++                     "lagged behind the skater (detached / jittering at speed) when it was redrawn "
++                     "only every other frame; keeping it current costs ~0.06 W at 60 fps")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(gpu_timestamp_queries, false, "GPU",
+                     "Measure GPU time per frame with a pair of Vulkan timestamp queries and "
+                     "publish it as the gpu_frame_us counter. Every other counter here is "
+@@ -4729,7 +4735,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         ++g_shadow_seen_frames[shadow_size];
+       }
+       bool skip = false;
+-      if (level > 0 && !memexport_writes_possible && !active_occlusion_query_.valid &&
++      if (level > 0 && (REXCVAR_GET(gpu_shadow_skip_mask) & (1 << shadow_size)) &&
++          !memexport_writes_possible && !active_occlusion_query_.valid &&
+           g_shadow_seen_frames[0] > 30 && g_shadow_seen_frames[1] > 30) {
+         const uint64_t period = level == 1 ? 2 : (level == 2 ? 4 : 16);
+         // The two sizes are staggered so every frame costs about the same.

@@ -1,0 +1,107 @@
+diff --git a/include/rex/ui/overlay/debug_overlay.h b/include/rex/ui/overlay/debug_overlay.h
+index e15e410..bb5813a 100644
+--- a/include/rex/ui/overlay/debug_overlay.h
++++ b/include/rex/ui/overlay/debug_overlay.h
+@@ -31,12 +31,15 @@ class DebugOverlayDialog : public ImGuiDialog {
+   ~DebugOverlayDialog();
+ 
+   void SetStatsProvider(FrameStatsProvider provider) { stats_provider_ = std::move(provider); }
++  // Compact: only the guest frame rate ("60 fps"), in the top right corner.
++  void SetCompact(bool compact) { compact_ = compact; }
+ 
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+  private:
+   FrameStatsProvider stats_provider_;
++  bool compact_ = false;
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   static constexpr size_t kFrameHistorySize = 120;
+   std::array<float, kFrameHistorySize> frame_time_history_{};
+diff --git a/src/ui/overlay/debug_overlay.cpp b/src/ui/overlay/debug_overlay.cpp
+index 43d6c06..cbfa297 100644
+--- a/src/ui/overlay/debug_overlay.cpp
++++ b/src/ui/overlay/debug_overlay.cpp
+@@ -12,6 +12,9 @@
+ #include <rex/ui/overlay/debug_overlay.h>
+ #include <rex/version.h>
+ #include <imgui.h>
++#include <chrono>
++#include <cstdio>
++
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+ #include <rex/perf/counter.h>
+ #include <cinttypes>
+@@ -25,7 +28,44 @@ DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProv
+ DebugOverlayDialog::~DebugOverlayDialog() {}
+ 
+ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
+-  ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
++#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  if (compact_) {
++    // Compact mode (the startup flag): only the guest frame rate, e.g. "60 fps", from the guest
++    // frame times averaged over half a second (with frame generation this is the game's own rate).
++    static double sum_ms = 0.0;
++    static uint32_t samples = 0;
++    static char text[32] = "-- fps";
++    static auto last_update = std::chrono::steady_clock::now();
++    const double ft_ms =
++        double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs)) / 1000.0;
++    if (ft_ms > 0.0) {
++      sum_ms += ft_ms;
++      ++samples;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_update >= std::chrono::milliseconds(500) && samples) {
++      std::snprintf(text, sizeof(text), "%.0f fps", 1000.0 / (sum_ms / samples));
++      sum_ms = 0.0;
++      samples = 0;
++      last_update = now;
++    }
++    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10, 10), ImGuiCond_Always,
++                            ImVec2(1.0f, 0.0f));
++    ImGui::SetNextWindowBgAlpha(0.45f);
++    if (ImGui::Begin("##fps", nullptr,
++                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
++                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
++                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
++      ImGui::SetWindowFontScale(2.0f);
++      ImGui::TextUnformatted(text);
++    }
++    ImGui::End();
++    return;
++  }
++#endif
++  // Top right: clear of the game's menus and of the test scripts' colour probes.
++  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10, 10), ImGuiCond_FirstUseEver,
++                          ImVec2(1.0f, 0.0f));
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
+ #else
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..58165f9 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -46,6 +46,10 @@
+ #include <filesystem>
+ #include <string_view>
+ 
++REXCVAR_DEFINE_BOOL(show_debug_overlay, false, "UI",
++                    "Show the guest frame rate (\"60 fps\") in the top right corner from startup "
++                    "(compact form of the F3 debug overlay)");
++
+ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
+                       "GPU emulation")
+@@ -402,6 +406,11 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+     }
+   });
++  if (REXCVAR_GET(show_debug_overlay)) {
++    debug_overlay_ =
++        std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
++    debug_overlay_->SetCompact(true);
++  }
+   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
+     if (console_overlay_) {
+       console_overlay_.reset();

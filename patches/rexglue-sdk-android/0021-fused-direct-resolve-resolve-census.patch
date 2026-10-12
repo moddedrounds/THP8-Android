@@ -1,0 +1,320 @@
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index fe55841..aca4337 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -759,7 +759,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+     draw_util::ResolveCopyShaderConstants resolve;
+     uint32_t source_base_tiles;
+     uint32_t source_pitch_tiles;
+-    uint32_t dispatch_first_tile;
++    // Fused resolve: host sample index of guest sample 0 (bits 0:1) and 1 (bits 2:3).
++    uint32_t source_sample_ids;
+   };
+ 
+   struct DirectResolvePipelineKey {
+@@ -858,6 +859,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
+   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
+       direct_resolve_pipelines_;
++  // Fused direct resolve (the fast 32bpp copy reading the host render target, no EDRAM dump), see
++  // tools/android/resolve_shaders: the single 8_8_8_8 render target owning the whole resolve span,
++  // already transitioned for the compute read, or nullptr if the resolve does not qualify.
++  VulkanRenderTarget* GetFusedResolveSource(const draw_util::ResolveInfo& resolve_info,
++                                            draw_util::ResolveCopyShaderIndex copy_shader,
++                                            bool draw_resolution_scaled);
++  // Fused resolve shader kinds: the fast 32bpp copy, the full 32bpp copy (format conversion,
++  // sample averaging), and the lean 8_8_8_8 -> 8_8_8_8 one (the common full case).
++  enum FusedResolveKind : uint32_t { kFusedResolveFast, kFusedResolveFull, kFusedResolve8888 };
++  VkPipeline GetFusedResolvePipeline(FusedResolveKind kind, bool msaa);
++  VkPipeline fused_resolve_pipelines_[3][2] = {};
++  FusedResolveKind fused_resolve_kind_ = kFusedResolveFast;
++  uint64_t fused_resolve_count_ = 0, fused_resolve_fallback_count_ = 0;
+ 
+   // Temporary storage for Resolve.
+   std::vector<Transfer> clear_transfers_[2];
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 00b948f..8b29284 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -37,6 +38,12 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_fused_resolve, false, "GPU/Vulkan",
++                    "Resolve 8_8_8_8 render targets with one compute pass that reads the host "
++                    "render target, instead of dumping it to the EDRAM buffer and copying from "
++                    "there (live flag 1073741824 inverts)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vulkan_disable_depth_unorm24, false, "GPU/Vulkan",
+                     "Do not use the native D24 host depth format even when the GPU offers it, "
+                     "emulating guest depth with 32-bit float like GPUs without D24 (desktop "
+@@ -71,6 +78,9 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+ 
+ namespace rex::graphics::vulkan {
+ 
++// command_processor.cpp: last live_flags.txt value.
++extern uint32_t g_live_diag_flags;
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
+@@ -98,6 +108,7 @@ namespace shaders {
+ #include "../shaders/vulkan_spirv/resolve_full_64bpp_cs.h"
+ #include "../shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.h"
+ #include "../shaders/vulkan_spirv/resolve_full_8bpp_cs.h"
++#include "direct_resolve_shaders.h"
+ #include "../shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h"
+ }  // namespace shaders
+ 
+@@ -1078,6 +1089,12 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
+     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_copy_pipeline);
+   }
++  for (auto& fused_resolve_pipelines : fused_resolve_pipelines_) {
++    for (VkPipeline& fused_resolve_pipeline : fused_resolve_pipelines) {
++      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                             fused_resolve_pipeline);
++    }
++  }
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          resolve_copy_pipeline_layout_);
+ 
+@@ -1156,6 +1173,35 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+     return true;
+   }
+ 
++  // Census: every 20 s, the next 60 resolves (about one frame and a half) are logged.
++  {
++    static auto census_last = std::chrono::steady_clock::time_point();
++    static uint32_t census_left = 0;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - census_last > std::chrono::seconds(20)) {
++      census_last = now;
++      census_left = 60;
++    }
++    if (census_left) {
++      --census_left;
++      uint32_t span_base, span_row_length, span_rows, span_pitch;
++      resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
++      REXGPU_INFO(
++          "resolve census: {}x{} src {} fmt {} msaa {} dest fmt {} copy {} clear d{} c{} span {} "
++          "rows x {} tiles (pitch {})",
++          resolve_info.coordinate_info.width_div_8 * 8, resolve_info.height_div_8 * 8,
++          resolve_info.IsCopyingDepth() ? "depth" : "color",
++          uint32_t(resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info.format
++                                                 : resolve_info.color_edram_info.format),
++          uint32_t(resolve_info.IsCopyingDepth()
++                       ? resolve_info.depth_edram_info.msaa_samples
++                       : resolve_info.color_edram_info.msaa_samples),
++          uint32_t(resolve_info.copy_dest_info.copy_dest_format),
++          resolve_info.copy_dest_extent_length ? 1 : 0, resolve_info.IsClearingDepth() ? 1 : 0,
++          resolve_info.IsClearingColor() ? 1 : 0, span_rows, span_row_length, span_pitch);
++    }
++  }
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -1175,8 +1221,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
+       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
+           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
++      VulkanRenderTarget* fused_rt =
++          GetFusedResolveSource(resolve_info, copy_shader, draw_resolution_scaled);
+       bool direct_resolved = false;
+-      if (GetPath() == Path::kHostRenderTargets) {
++      if (GetPath() == Path::kHostRenderTargets && !fused_rt) {
+         if (REXCVAR_GET(direct_host_resolve)) {
+           direct_resolved =
+               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
+@@ -1194,7 +1242,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           uint32_t dump_rows;
+           uint32_t dump_pitch;
+           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
++          // Live flag 536870912: skip the dump (diagnostic: the copy reads stale EDRAM data).
++          if (!(g_live_diag_flags & 536870912u) &&
++              !DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
+             return false;
+           }
+@@ -1273,6 +1323,30 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),
+                                                             uint32_t(copy_dest_use_length)));
+           }
++          if (fused_rt) {
++            // One pass from the render target to shared memory (unscaled only).
++            copy_shader_constants.dest_base -=
++                uint32_t(write_descriptor_set_dest_buffer_info.offset);
++            const RenderTargetKey fused_key = fused_rt->key();
++            command_processor_.BindExternalComputePipeline(GetFusedResolvePipeline(
++                fused_resolve_kind_, fused_key.msaa_samples != xenos::MsaaSamples::k1X));
++            VkDescriptorSet fused_sets[] = {descriptor_set_dest,
++                                            fused_rt->GetDescriptorSetTransferSource()};
++            command_buffer.CmdVkBindDescriptorSets(
++                VK_PIPELINE_BIND_POINT_COMPUTE, direct_resolve_pipeline_layout_color_, 0,
++                uint32_t(rex::countof(fused_sets)), fused_sets, 0, nullptr);
++            DirectResolvePushConstants fused_constants;
++            fused_constants.resolve = copy_shader_constants;
++            fused_constants.source_base_tiles = fused_key.base_tiles;
++            fused_constants.source_pitch_tiles = fused_key.GetPitchTiles();
++            fused_constants.source_sample_ids =
++                draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_) |
++                (draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_attachments_supported_)
++                 << 2);
++            command_buffer.CmdVkPushConstants(direct_resolve_pipeline_layout_color_,
++                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                              sizeof(fused_constants), &fused_constants);
++          } else {
+           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+           command_processor_.BindExternalComputePipeline(
+               resolve_copy_pipelines_[size_t(copy_shader)]);
+@@ -1296,6 +1370,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                 sizeof(copy_shader_constants), &copy_shader_constants);
+           }
++          }
+           command_processor_.SubmitBarriers(true);
+           command_processor_.TimingStamp("res_copy_prep");
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+@@ -5970,6 +6045,121 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+   return pipeline;
+ }
+ 
++VulkanRenderTargetCache::VulkanRenderTarget*
++VulkanRenderTargetCache::GetFusedResolveSource(
++    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
++    bool draw_resolution_scaled) {
++  if (GetPath() != Path::kHostRenderTargets || !REXCVAR_GET(direct_host_resolve) ||
++      REXCVAR_GET(gpu_fused_resolve) == ((g_live_diag_flags & 1073741824u) != 0)) {
++    return nullptr;
++  }
++  VulkanRenderTarget* result = nullptr;
++  // Fallback reasons: 0 copy shader, 1 depth, 2 rectangles, 3 format / MSAA, 4 coverage.
++  static uint64_t fallback_reasons[5] = {};
++  uint32_t fallback_reason = 0;
++  const bool full_copy = copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
++  if ((copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA || full_copy) &&
++      !draw_resolution_scaled && !resolve_info.IsCopyingDepth() &&
++      direct_resolve_pipeline_layout_color_ != VK_NULL_HANDLE) {
++    fallback_reason = 2;
++    uint32_t span_base, span_row_length, span_rows, span_pitch;
++    resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
++    GetResolveCopyRectanglesToDump(span_base, span_row_length, span_rows, span_pitch,
++                                   dump_rectangles_);
++    if (dump_rectangles_.size() == 1) {
++      const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
++      auto* rt = static_cast<VulkanRenderTarget*>(rectangle.render_target);
++      const RenderTargetKey rt_key = rt->key();
++      fallback_reason = (rt_key.is_depth ||
++                         rt_key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++                         rt_key.msaa_samples > xenos::MsaaSamples::k2X)
++                            ? 3
++                            : 4;
++      if (!rt_key.is_depth &&
++          rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
++          rt_key.msaa_samples <= xenos::MsaaSamples::k2X && rectangle.row_first == 0 &&
++          rectangle.rows == span_rows && rectangle.row_first_start == 0 &&
++          rectangle.row_last_end == span_row_length) {
++        fused_resolve_kind_ = kFusedResolveFast;
++        if (full_copy) {
++          // The lean shader: 8_8_8_8 destination, and a sample selection it implements.
++          const uint32_t dest_format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
++          const uint32_t sample_select =
++              uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select);
++          const bool lean_select = rt_key.msaa_samples == xenos::MsaaSamples::k1X
++                                       ? sample_select == 0
++                                       : (sample_select <= 1 || sample_select == 4);
++          fused_resolve_kind_ =
++              ((dest_format == 6 || dest_format == 14 || dest_format == 50) && lean_select)
++                  ? kFusedResolve8888
++                  : kFusedResolveFull;
++        }
++      }
++      if (result == nullptr && fallback_reason == 4 &&
++          rectangle.row_first == 0 && rectangle.rows == span_rows &&
++          rectangle.row_first_start == 0 && rectangle.row_last_end == span_row_length &&
++          GetFusedResolvePipeline(fused_resolve_kind_,
++                                  rt_key.msaa_samples != xenos::MsaaSamples::k1X) !=
++              VK_NULL_HANDLE) {
++        command_processor_.PushImageMemoryBarrier(
++            rt->image(), ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++            rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, rt->current_layout(),
++            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        result = rt;
++      }
++    }
++  }
++  if (!result && resolve_info.IsCopyingDepth() && fallback_reason == 0) {
++    fallback_reason = 1;
++  }
++  ++(result ? fused_resolve_count_ : fused_resolve_fallback_count_);
++  if (!result) {
++    ++fallback_reasons[fallback_reason];
++  }
++  if (fused_resolve_count_ + fused_resolve_fallback_count_ >= 4000) {
++    REXGPU_INFO(
++        "fused resolve: {} fused, {} through the EDRAM dump (copy shader {}, depth {}, "
++        "rectangles {}, format/MSAA {}, coverage {}; last copy shader {})",
++        fused_resolve_count_, fused_resolve_fallback_count_, fallback_reasons[0],
++        fallback_reasons[1], fallback_reasons[2], fallback_reasons[3], fallback_reasons[4],
++        uint32_t(copy_shader));
++    fused_resolve_count_ = fused_resolve_fallback_count_ = 0;
++    for (uint64_t& reason : fallback_reasons) {
++      reason = 0;
++    }
++  }
++  return result;
++}
++
++VkPipeline VulkanRenderTargetCache::GetFusedResolvePipeline(FusedResolveKind kind, bool msaa) {
++  VkPipeline& pipeline = fused_resolve_pipelines_[kind][msaa ? 1 : 0];
++  if (pipeline == VK_NULL_HANDLE) {
++    static const std::pair<const uint32_t*, size_t> kCode[3][2] = {
++        {{shaders::direct_resolve_fast_32bpp_msaa0_cs,
++          sizeof(shaders::direct_resolve_fast_32bpp_msaa0_cs)},
++         {shaders::direct_resolve_fast_32bpp_msaa1_cs,
++          sizeof(shaders::direct_resolve_fast_32bpp_msaa1_cs)}},
++        {{shaders::direct_resolve_full_32bpp_msaa0_cs,
++          sizeof(shaders::direct_resolve_full_32bpp_msaa0_cs)},
++         {shaders::direct_resolve_full_32bpp_msaa1_cs,
++          sizeof(shaders::direct_resolve_full_32bpp_msaa1_cs)}},
++        {{shaders::direct_resolve_8888_msaa0_cs, sizeof(shaders::direct_resolve_8888_msaa0_cs)},
++         {shaders::direct_resolve_8888_msaa1_cs, sizeof(shaders::direct_resolve_8888_msaa1_cs)}},
++    };
++    const auto& code = kCode[kind][msaa ? 1 : 0];
++    pipeline = ui::vulkan::util::CreateComputePipeline(command_processor_.GetVulkanDevice(),
++                                                       direct_resolve_pipeline_layout_color_,
++                                                       code.first, code.second);
++    if (pipeline == VK_NULL_HANDLE) {
++      REXGPU_ERROR("VulkanRenderTargetCache: failed to create the fused resolve pipeline");
++    }
++  }
++  return pipeline;
++}
++
+ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipelineKey key) {
+   auto pipeline_it = direct_resolve_pipelines_.find(key);
+   if (pipeline_it != direct_resolve_pipelines_.end()) {
+@@ -6032,6 +6222,9 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
+ 
+   // Dedicated direct resolve dispatches are staged behind the same preflight;
+   // keep using the existing dump path until source-image direct shaders land.
++  if (g_live_diag_flags & 536870912u) {
++    return true;  // Diagnostic: no dump (the copy reads stale EDRAM data).
++  }
+   return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+ }
+ 

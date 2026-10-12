@@ -1,0 +1,229 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 63d0c26..ffdf03c 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -937,7 +937,60 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<uint64_t> pass_read_page_bits_;
+   std::vector<uint32_t> pass_read_page_words_;
+   bool pass_shared_memory_reads_overflow_ = false;
+-  std::unordered_set<VkImage> pass_sampled_images_;
++  // Images sampled by the draws of the current pass (hoist conflict checks): an open-addressing
++  // set cleared by bumping a generation - a std::unordered_set insert per texture per draw (node
++  // allocation) was ~2.5 % of the command processor.
++  class ImageSet {
++   public:
++    void insert(VkImage image) {
++      if ((size_ + 1) * 2 > slots_.size()) Grow();
++      Slot* slot = Find(image);
++      if (slot->generation != generation_) {
++        slot->image = image;
++        slot->generation = generation_;
++        ++size_;
++      }
++    }
++    size_t count(VkImage image) const {
++      return slots_.empty() ? 0 : Find(image)->generation == generation_;
++    }
++    void clear() {
++      size_ = 0;
++      if (++generation_ == 0) {
++        for (Slot& slot : slots_) slot.generation = 0;
++        generation_ = 1;
++      }
++    }
++
++   private:
++    struct Slot {
++      VkImage image = VK_NULL_HANDLE;
++      uint32_t generation = 0;
++    };
++    Slot* Find(VkImage image) const {
++      const size_t mask = slots_.size() - 1;
++      size_t i = size_t((uint64_t(reinterpret_cast<uintptr_t>(image)) * 0x9E3779B97F4A7C15ull) >> 40) & mask;
++      while (true) {
++        Slot* slot = const_cast<Slot*>(&slots_[i]);
++        if (slot->generation != generation_ || slot->image == image) return slot;
++        i = (i + 1) & mask;
++      }
++    }
++    void Grow() {
++      std::vector<Slot> old = std::move(slots_);
++      slots_.assign(old.empty() ? 256 : old.size() * 2, Slot{});
++      const uint32_t old_generation = generation_;
++      generation_ = 1;
++      size_ = 0;
++      for (const Slot& slot : old) {
++        if (slot.generation == old_generation) insert(slot.image);
++      }
++    }
++    std::vector<Slot> slots_;
++    uint32_t generation_ = 1;
++    size_t size_ = 0;
++  };
++  ImageSet pass_sampled_images_;
+   bool texture_hoist_active_ = false;
+   bool texture_hoist_conflict_ = false;
+   size_t texture_hoist_tail_start_ = 0;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 38a7586..e260ddd 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -43,13 +43,29 @@ class DeferredCommandBuffer {
+   // Moves the commands written since tail_start to destination (destination <= tail_start), keeping
+   // their order and the order of everything else. Commands carry their own size and no absolute
+   // offsets, so this is safe as long as both positions are command boundaries.
+-  void MoveTailTo(size_t tail_start, size_t destination) {
+-    // The tail (an upload block) is small, the part it moves in front of can be a whole pass:
+-    // copy the tail aside and memmove the rest, instead of std::rotate over everything per upload.
++  //
++  // lazy: the block is cut out and kept aside, and all blocks for the same destination are inserted
++  // there at once by CommitPendingSplice() (in recording order). The pass in front of which hoisted
++  // uploads / texture loads go can be long, and moving it once per hoisted block was ~4 % of the
++  // command processor. Returns how far destination and everything after it moved now (the block
++  // size when moved at once, 0 when kept aside).
++  size_t MoveTailTo(size_t tail_start, size_t destination, bool lazy = false) {
+     const size_t tail_size = command_stream_.size() - tail_start;
+     if (!tail_size || destination >= tail_start) {
+-      return;
++      return 0;
++    }
++    if (lazy && (pending_destination_ == SIZE_MAX || pending_destination_ == destination)) {
++      pending_.insert(pending_.end(), command_stream_.begin() + std::ptrdiff_t(tail_start),
++                      command_stream_.end());
++      command_stream_.resize(tail_start);
++      pending_destination_ = destination;
++      return 0;
+     }
++    if (pending_destination_ != SIZE_MAX && destination < pending_destination_) {
++      tail_start += CommitPendingSplice();
++    }
++    // The tail (an upload block) is small, the part it moves in front of can be a whole pass:
++    // copy the tail aside and memmove the rest, instead of std::rotate over everything per upload.
+     using Element = std::remove_reference_t<decltype(command_stream_[0])>;
+     move_tail_scratch_.assign(command_stream_.begin() + std::ptrdiff_t(tail_start),
+                               command_stream_.end());
+@@ -57,6 +73,26 @@ class DeferredCommandBuffer {
+     std::memmove(base + destination + tail_size, base + destination,
+                  (tail_start - destination) * sizeof(Element));
+     std::memcpy(base + destination, move_tail_scratch_.data(), tail_size * sizeof(Element));
++    return tail_size;
++  }
++
++  // Inserts the blocks kept aside by lazy MoveTailTo calls; returns how far their destination and
++  // everything after it moved.
++  size_t CommitPendingSplice() {
++    const size_t n = pending_.size();
++    if (!n) {
++      pending_destination_ = SIZE_MAX;
++      return 0;
++    }
++    const size_t destination = pending_destination_;
++    const size_t old_size = command_stream_.size();
++    command_stream_.resize(old_size + n);
++    auto* base = command_stream_.data();
++    std::memmove(base + destination + n, base + destination, (old_size - destination) * sizeof(*base));
++    std::memcpy(base + destination, pending_.data(), n * sizeof(*base));
++    pending_.clear();
++    pending_destination_ = SIZE_MAX;
++    return n;
+   }
+ 
+   // render_pass_begin->pNext of all barriers must be null.
+@@ -633,6 +669,9 @@ class DeferredCommandBuffer {
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+   std::vector<uintmax_t> command_stream_;
+   std::vector<uintmax_t> move_tail_scratch_;
++  // Blocks kept aside by lazy MoveTailTo, to be inserted at pending_destination_.
++  std::vector<uintmax_t> pending_;
++  size_t pending_destination_ = SIZE_MAX;
+ 
+   // Scissor tracking for LimitRenderPassArea.
+   bool scissor_known_ = false;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index cf9c100..a8b65f7 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -549,7 +549,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   }
+ 
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
++  // Reused between calls (one allocation per draw used to be ~1.5 % of the command processor).
++  thread_local std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
++  merged_ranges.clear();
+   merged_ranges.reserve(count);
+   for (size_t i = 0; i < count; ++i) {
+     uint32_t start = ranges[i].first;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index fa11fde..3e159b0 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4077,6 +4077,12 @@ void VulkanCommandProcessor::EndTextureHoist() {
+     texture_hoist_active_ = false;  // From here on barriers and pass ends act normally again.
+     texture_hoist_conflict_ = false;
+     ++g_hoist_fallback;
++    // Positions below are about to be used across EndRenderPass, which inserts the blocks kept
++    // aside for this pass: insert them now and account for the shift.
++    if (const size_t shift = deferred_command_buffer_.CommitPendingSplice()) {
++      tail_start += shift;
++      render_pass_begin_position_ += shift;
++    }
+     if (in_render_pass_ && deferred_command_buffer_.Position() > tail_start) {
+       const size_t end_position = deferred_command_buffer_.Position();
+       EndRenderPass();
+@@ -4093,8 +4099,8 @@ void VulkanCommandProcessor::EndTextureHoist() {
+   const size_t block_size = deferred_command_buffer_.Position() - tail_start;
+   ++(block_size ? g_hoist_nonempty : g_hoist_empty);
+   if (block_size && in_render_pass_ && render_pass_begin_position_ != SIZE_MAX) {
+-    deferred_command_buffer_.MoveTailTo(tail_start, render_pass_begin_position_);
+-    AdvanceRenderPassBeginPosition(block_size);
++    AdvanceRenderPassBeginPosition(
++        deferred_command_buffer_.MoveTailTo(tail_start, render_pass_begin_position_, true));
+     ++g_hoist_done;
+   }
+ }
+@@ -4141,6 +4147,8 @@ void VulkanCommandProcessor::EndRenderPass(const char* reason_file, uint32_t rea
+   current_framebuffer_ = nullptr;
+   in_render_pass_ = false;
+   render_pass_begin_position_ = SIZE_MAX;
++  // Hoisted blocks kept aside go in front of the pass now (one move per pass).
++  deferred_command_buffer_.CommitPendingSplice();
+ }
+ 
+ void VulkanCommandProcessor::ForceHostMsaaOff() {
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 9f67957..c680d35 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -32,6 +32,8 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ 
+ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
++  pending_.clear();
++  pending_destination_ = SIZE_MAX;
+   scissor_known_ = false;
+   pass_area_tracking_ = false;
+   pass_area_unlimited_ = false;
+@@ -78,6 +80,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  CommitPendingSplice();
+   const ui::vulkan::VulkanDevice::Functions& dfn =
+       command_processor_.GetVulkanDevice()->functions();
+   const uintmax_t* stream = command_stream_.data();
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index fa6f01f..8dc28c2 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -438,8 +438,8 @@ void VulkanSharedMemory::FlushHoistedUploads() {
+                                         nullptr, 1, &barrier, 0, nullptr);
+   }
+   if (begin_position != SIZE_MAX) {
+-    command_buffer.MoveTailTo(tail_start, begin_position);
+-    command_processor_.AdvanceRenderPassBeginPosition(command_buffer.Position() - tail_start);
++    command_processor_.AdvanceRenderPassBeginPosition(
++        command_buffer.MoveTailTo(tail_start, begin_position, true));
+   }
+ }
+ 

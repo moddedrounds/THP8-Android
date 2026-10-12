@@ -1,0 +1,302 @@
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 04dd33a..55e1567 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -62,6 +62,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #define REX_HAS_SIGEV_THREAD_ID 0
+ #endif
+ 
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(event_signal_fast, true, "Kernel",
++                    "Event signals wake waiters only when a thread is actually waiting, and after "
++                    "releasing the event's lock (a waiter woken under the lock blocked on it at once). "
++                    "Saves a futex system call per signal with nobody waiting")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::thread {
+ 
+ #if REX_PLATFORM_ANDROID
+@@ -317,12 +325,14 @@ class PosixConditionBase {
+     if (predicate()) {
+       executed = true;
+     } else {
++      ++waiters_;
+       if (timeout == std::chrono::milliseconds::max()) {
+         cond_.wait(lock, predicate);
+         executed = true;  // Did not time out;
+       } else {
+         executed = cond_.wait_for(lock, timeout, predicate);
+       }
++      --waiters_;
+     }
+     if (executed) {
+       post_execution();
+@@ -447,6 +457,7 @@ class PosixConditionBase {
+   inline virtual void post_execution() = 0;
+   std::condition_variable cond_;
+   std::mutex mutex_;
++  int waiters_ = 0;  // threads inside Wait()'s condition wait (guarded by mutex_)
+ };
+ 
+ // There really is no native POSIX handle for a single wait/signal construct
+@@ -466,6 +477,15 @@ class PosixCondition<Event> : public PosixConditionBase {
+   bool Signal() override {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
++    if (REXCVAR_GET(event_signal_fast)) {
++      // WaitMultiple polls (it never sleeps on cond_), so only Wait() callers need a wake-up.
++      const bool wake = waiters_ != 0;
++      lock.unlock();
++      if (wake) {
++        cond_.notify_all();
++      }
++      return true;
++    }
+     cond_.notify_all();
+     return true;
+   }
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index c8d2c4c..56cc008 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -131,6 +131,10 @@ REXCVAR_DEFINE_BOOL(gpu_pacing_trace, false, "GPU",
+ 
+ // Frame-pacing trace (diagnostic): (time, code, arg) events from the CP, vsync and interrupt paths,
+ // dumped as one log line every 150 swaps covering the last 120 ms.
++REXCVAR_DEFINE_UINT32(gpu_swap_cap_spin_us, 3000, "GPU",
++                      "The swap cap wait sleeps to this many microseconds before the target vblank "
++                      "and spins the rest. 0 = sleep only")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(gpu_swap_fps_cap, 0, "GPU",
+                       "Cap guest swaps to this rate (0 = off): before a swap the command processor "
+                       "waits until 60/cap guest vblanks have passed since the previous one, so a "
+@@ -1444,7 +1448,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+                                    int64_t(target - g_vblank_count - 1);
+         }
+       }
+-      g_vblank_cv.wait_until(lock, target_time - std::chrono::microseconds(3000),
++      g_vblank_cv.wait_until(lock,
++                             target_time - std::chrono::microseconds(REXCVAR_GET(gpu_swap_cap_spin_us)),
+                              [target] { return g_vblank_count >= target; });
+       const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+       // Spin without the lock (NoteGuestVblank needs it to advance the count).
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 7ce4357..deca755 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -34,6 +34,11 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++REXCVAR_DEFINE_UINT32(vblank_spin_us, 3000, "GPU",
++                      "The vblank thread sleeps to this many microseconds before each vblank and "
++                      "spins the rest (a plain sleep woke up to 2-3 ms late on Android). 0 = sleep "
++                      "only: no spinning, less CPU power")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -183,7 +188,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+               vblank_grid_ready_.store(true, std::memory_order_release);
+             }
+             const auto edge = NextVblankTime();
+-            const auto spin_from = edge - std::chrono::microseconds(3000);
++            const auto spin_from = edge - std::chrono::microseconds(REXCVAR_GET(vblank_spin_us));
+             if (spin_from > std::chrono::steady_clock::now()) {
+               rex::thread::SleepUntil(spin_from);
+             }
+@@ -209,7 +214,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             // plain sleep was measured up to 3-4 ms late on Android, which
+             // moved the guest's vblank and with it the swap.
+             // 3 ms: wakes up to ~2.5 ms late were still seen with a 1 ms margin.
+-            const auto spin_from = next_wake - std::chrono::microseconds(3000);
++            const auto spin_from =
++                next_wake - std::chrono::microseconds(REXCVAR_GET(vblank_spin_us));
+             if (spin_from > now) {
+               rex::thread::SleepUntil(spin_from);
+             }
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1344d93..fa11fde 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -75,7 +75,12 @@ REXCVAR_DEFINE_BOOL(gpu_native_vertex_fetch, false, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(gpu_frame_generation, false, "GPU/Vulkan",
+                     "Frame generation: at every swap also present a motion-compensated frame halfway "
+                     "between the previous and the current guest frame, so a 30 fps game is shown at "
+-                    "60. Use with FIFO presentation (disallow mailbox/immediate present modes).")
++                    "60. Use with FIFO presentation (disallow mailbox/immediate present modes). "
++                    "Live when the generator exists (gpu_frame_generation_available).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(gpu_frame_generation_available, false, "GPU/Vulkan",
++                    "Create the frame generator even when gpu_frame_generation starts off, so it can "
++                    "be switched on while the game runs (in-game menu)")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ REXCVAR_DEFINE_INT32(gpu_frame_generation_factor, 0, "GPU/Vulkan",
+                      "Frames shown per guest frame with gpu_frame_generation: 2 (30 -> 60 on a 60 Hz "
+@@ -2195,7 +2200,7 @@ bool VulkanCommandProcessor::SetupContext() {
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+ 
+-  if (REXCVAR_GET(gpu_frame_generation)) {
++  if (REXCVAR_GET(gpu_frame_generation) || REXCVAR_GET(gpu_frame_generation_available)) {
+     frame_generator_ = std::make_unique<FrameGenerator>(*this);
+     if (!frame_generator_->Initialize()) {
+       REXGPU_WARN("Frame generation unavailable");
+@@ -3348,7 +3353,39 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   // the real frame into a slot of the generator's images; its pacer thread presents them on
+   // consecutive vblanks, so presentation never blocks the command processor.
+   bool frame_generated = false;
+-  if (frame_generator_) {
++  int factor = REXCVAR_GET(gpu_frame_generation_factor);
++  if (frame_generator_ && REXCVAR_GET(gpu_frame_generation) && factor <= 0) {
++    // Auto: one shown frame per display refresh at the guest's capped rate.
++    static int display_hz = 60;
++    static auto last_read = std::chrono::steady_clock::time_point();
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_read > std::chrono::seconds(2)) {
++      last_read = now;
++      if (FILE* f = std::fopen(
++              "/sdcard/Android/data/org.project8recomp.android/files/display_hz.txt", "r")) {
++        int hz = 0;
++        if (std::fscanf(f, "%d", &hz) == 1 && hz >= 30 && hz <= 240) {
++          display_hz = hz;
++        }
++        std::fclose(f);
++      }
++    }
++    // gpu_swap_fps_cap is defined in the runtime library (not exported to this plugin).
++    static uint32_t cap = 30;
++    static int cap_reads = 0;
++    if (cap_reads++ % 30 == 0) {
++      cap = REXCVAR_QUERY(uint32_t, gpu_swap_fps_cap);
++    }
++    const int guest_hz = int(std::clamp<uint32_t>(cap, 30, 60));
++    factor = std::min((display_hz + guest_hz / 2) / guest_hz,
++                      REXCVAR_GET(gpu_frame_generation_max_factor));
++  }
++  const bool generate = frame_generator_ && REXCVAR_GET(gpu_frame_generation) && factor >= 2;
++  if (frame_generator_ && !generate) {
++    // Switched off while running: let the pacer finish what it queued before presenting directly.
++    frame_generator_->WaitIdle();
++  }
++  if (generate) {
+     const int slot = frame_generator_->AcquireSlot();
+     if (slot >= 0 && frame_generator_->EnsureOutputs(guest_output_width, guest_output_height) &&
+         BeginSubmission(true)) {
+@@ -3360,25 +3397,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       entry.height = guest_output_height;
+       entry.display_width = display_width;
+       entry.display_height = display_height;
+-      int factor = REXCVAR_GET(gpu_frame_generation_factor);
+-      if (factor <= 0) {
+-        // Auto: one shown frame per display refresh at the guest's 30 fps.
+-        static int display_hz = 60;
+-        static auto last_read = std::chrono::steady_clock::time_point();
+-        const auto now = std::chrono::steady_clock::now();
+-        if (now - last_read > std::chrono::seconds(2)) {
+-          last_read = now;
+-          if (FILE* f = std::fopen(
+-                  "/sdcard/Android/data/org.project8recomp.android/files/display_hz.txt", "r")) {
+-            int hz = 0;
+-            if (std::fscanf(f, "%d", &hz) == 1 && hz >= 30 && hz <= 240) {
+-              display_hz = hz;
+-            }
+-            std::fclose(f);
+-          }
+-        }
+-        factor = std::min((display_hz + 15) / 30, REXCVAR_GET(gpu_frame_generation_max_factor));
+-      }
+       factor = std::clamp(factor, 2, 4);
+       float times[FrameGenerator::kMaxGenerated];
+       for (int k = 0; k < factor - 1; ++k) {
+diff --git a/src/graphics/vulkan/frame_generation.cpp b/src/graphics/vulkan/frame_generation.cpp
+index dd512bf..f5c4607 100755
+--- a/src/graphics/vulkan/frame_generation.cpp
++++ b/src/graphics/vulkan/frame_generation.cpp
+@@ -514,6 +514,13 @@ void FrameGenerator::DestroyOutputs() {
+   output_width_ = output_height_ = 0;
+ }
+ 
++void FrameGenerator::WaitIdle() {
++  std::unique_lock<std::mutex> lock(pacer_mutex_);
++  pacer_cv_.wait(lock, [&] {
++    return pacer_stop_ || (pacer_queue_.empty() && !slot_busy_[0] && !slot_busy_[1]);
++  });
++}
++
+ void FrameGenerator::Submit(const Entry& entry, ui::Presenter* presenter) {
+   {
+     std::lock_guard<std::mutex> lock(pacer_mutex_);
+diff --git a/src/graphics/vulkan/frame_generation.h b/src/graphics/vulkan/frame_generation.h
+index 8109a09..8b47303 100755
+--- a/src/graphics/vulkan/frame_generation.h
++++ b/src/graphics/vulkan/frame_generation.h
+@@ -47,6 +47,8 @@ class FrameGenerator {
+   static constexpr int kMaxGenerated = 3;
+   // Produces `count` (<= kMaxGenerated) frames at the times `t` (ascending, in (0, 1)).
+   int Record(VkImageView current, uint32_t width, uint32_t height, const float* t, int count);
++  // Blocks until the pacer thread has presented everything queued (no-op when idle).
++  void WaitIdle();
+   VkImageView interpolated_view(int k) const { return interp_[k].view; }
+ 
+   // Presentation. The swap renders the interpolated and the real frame (through the usual swap
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+index db02605..30bf025 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+@@ -31,6 +31,14 @@
+ #include <rex/thread.h>
+ #include <rex/thread/atomic.h>
+ 
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_UINT32(rtl_critical_section_spin_cap, 0, "Kernel",
++                      "Upper bound of a guest critical section's spin count before it waits in the "
++                      "kernel (0 = the count the game asked for, up to 65280 iterations). Spinning "
++                      "burns a core at full clock while another thread holds the lock")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -379,6 +387,9 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
+ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
+   uint32_t spin_count = cs->header.absolute * 256;
++  if (const uint32_t cap = REXCVAR_GET(rtl_critical_section_spin_cap)) {
++    spin_count = std::min(spin_count, cap);
++  }
+ 
+   if (cs->owning_thread == cur_thread) {
+     // We already own the lock.
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..add9492 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -26,6 +26,10 @@
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++REXCVAR_DEFINE_UINT32(present_effect_live, 0, "UI/Presenter",
++                      "Live override of present_effect, read every paint: 0 = use present_effect, "
++                      "1 = bilinear, 2 = FSR 1 (where built)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+@@ -807,6 +811,14 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+     // UI thread.
+     std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
+     *paint_config_out = guest_output_paint_config_;
++    if (const uint32_t live = REXCVAR_GET(present_effect_live)) {
++#if defined(REX_HAS_FIDELITYFX_SDK)
++      paint_config_out->SetEffect(live == 2 ? GuestOutputPaintConfig::Effect::kFsr
++                                            : GuestOutputPaintConfig::Effect::kBilinear);
++#else
++      paint_config_out->SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
++#endif
++    }
+   }
+ 
+   // Lock the mutex to make sure the image that will be acquired now is owned

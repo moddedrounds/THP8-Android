@@ -1,0 +1,59 @@
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 3825a9c..7bfb4f4 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -26,6 +26,12 @@
+ #include <rex/math.h>
+ #include <rex/string/buffer.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_relaxed_interpolators, false, "GPU/Shader",
++                    "Experiment: vertex shader outputs and pixel shader inputs (interpolators) are "
++                    "RelaxedPrecision, so the driver may pass them at 16 bits. Read at translation "
++                    "time and not part of the shader key: clear the shader caches when switching")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics {
+ 
+ SpirvShaderTranslator::Features::Features(bool all)
+@@ -1734,6 +1740,9 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+       input_output_interpolators_[interpolator_index] = interpolator;
+       builder_->addDecoration(interpolator, spv::DecorationLocation, int(output_location));
+       builder_->addDecoration(interpolator, spv::DecorationInvariant);
++      if (REXCVAR_GET(gpu_relaxed_interpolators)) {
++        builder_->addDecoration(interpolator, spv::DecorationRelaxedPrecision);
++      }
+       main_interface_.push_back(interpolator);
+       ++output_location;
+     }
+@@ -2915,6 +2924,9 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+             fmt::format("xe_in_interpolator_{}", interpolator_index).c_str());
+         input_output_interpolators_[interpolator_index] = interpolator;
+         builder_->addDecoration(interpolator, spv::DecorationLocation, int(input_location));
++        if (REXCVAR_GET(gpu_relaxed_interpolators)) {
++          builder_->addDecoration(interpolator, spv::DecorationRelaxedPrecision);
++        }
+         if (shader_modification.pixel.interpolators_centroid &
+             (UINT32_C(1) << interpolator_index)) {
+           builder_->addDecoration(interpolator, spv::DecorationCentroid);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 3e159b0..9928549 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4709,7 +4709,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     const uint32_t scissor_w = scissor_br.br_x - scissor_tl.tl_x;
+     const uint32_t scissor_h = scissor_br.br_y - scissor_tl.tl_y;
+     int shadow_size = -1;
+-    if (surface_info.msaa_samples == xenos::MsaaSamples::k1X && scissor_w == scissor_h) {
++    // A shadow map pass writes float-24 depth and no colour. Without that check, with the game's
++    // 1x MSAA display mode, square 512 glow passes of the menus were skipped too (they accumulate:
++    // the picture blew out).
++    const bool depth_only_f24 =
++        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8 &&
++        normalized_depth_control.z_enable &&
++        !(pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
++                       : 0u);
++    if (depth_only_f24 && surface_info.msaa_samples == xenos::MsaaSamples::k1X &&
++        scissor_w == scissor_h) {
+       shadow_size = scissor_w == 1024 ? 0 : (scissor_w == 512 ? 1 : -1);
+     }
+     if (shadow_size < 0) {

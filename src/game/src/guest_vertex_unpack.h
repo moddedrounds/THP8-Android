@@ -117,6 +117,11 @@ inline void SplatWord(const uint8_t *source, uint8_t *destination) {
   }
 }
 
+// The u8x4 decodes at +96 / +144 and the splats at +432 / +448 take the LAST word (w) of the
+// source vectors at +0 / +32 / +16 / +48: the guest splats it with vpermwi128 v, v, 255 first.
+// (The first version used word 0. That only matched records whose x and w are equal, e.g. most
+// level materials; the character creator's skater got a specular power of 49 where an intensity
+// of 0.9 belongs and rendered blown-out white / yellow.)
 inline void TransformScalar(const uint8_t *source, uint8_t *destination) {
   DecodeU8x4(source + 244, destination + 0);
   DecodePacked(source + 220, destination + 16);
@@ -125,10 +130,10 @@ inline void TransformScalar(const uint8_t *source, uint8_t *destination) {
   DecodeU8x4(source + 236, destination + 64);
 
   CopyXyzNegativeZeroW(source + 0, destination + 80);
-  DecodeU8x4(source + 0, destination + 96);
+  DecodeU8x4(source + 12, destination + 96);
   CopyXyzNegativeZeroW(source + 16, destination + 112);
   CopyXyzNegativeZeroW(source + 32, destination + 128);
-  DecodeU8x4(source + 32, destination + 144);
+  DecodeU8x4(source + 44, destination + 144);
   CopyXyzNegativeZeroW(source + 48, destination + 160);
   DecodePacked(source + 76, destination + 176);
   std::memcpy(destination + 192, source + 64, 16);
@@ -151,8 +156,8 @@ inline void TransformScalar(const uint8_t *source, uint8_t *destination) {
 
   SplatWord(source + 228, destination + 400);
   SplatWord(source + 240, destination + 416);
-  SplatWord(source + 16, destination + 432);
-  SplatWord(source + 48, destination + 448);
+  SplatWord(source + 28, destination + 432);
+  SplatWord(source + 60, destination + 448);
   SplatWord(source + 108, destination + 464);
 
   const uint32_t flags = ReadBe32(source + 248);
@@ -215,10 +220,10 @@ THPS_VERTEX_UNPACK_SIMD_TARGET inline void TransformSimd(const uint8_t *source,
   DecodeU8x4Simd(source + 236, destination + 64);
 
   CopyXyzNegativeZeroW(source + 0, destination + 80);
-  DecodeU8x4Simd(source + 0, destination + 96);
+  DecodeU8x4Simd(source + 12, destination + 96);
   CopyXyzNegativeZeroW(source + 16, destination + 112);
   CopyXyzNegativeZeroW(source + 32, destination + 128);
-  DecodeU8x4Simd(source + 32, destination + 144);
+  DecodeU8x4Simd(source + 44, destination + 144);
   CopyXyzNegativeZeroW(source + 48, destination + 160);
   DecodePackedSimd(source + 76, destination + 176);
   std::memcpy(destination + 192, source + 64, 16);
@@ -238,8 +243,8 @@ THPS_VERTEX_UNPACK_SIMD_TARGET inline void TransformSimd(const uint8_t *source,
 
   SplatWordSimd(source + 228, destination + 400);
   SplatWordSimd(source + 240, destination + 416);
-  SplatWordSimd(source + 16, destination + 432);
-  SplatWordSimd(source + 48, destination + 448);
+  SplatWordSimd(source + 28, destination + 432);
+  SplatWordSimd(source + 60, destination + 448);
   SplatWordSimd(source + 108, destination + 464);
 
   const uint32_t flags = ReadBe32(source + 248);

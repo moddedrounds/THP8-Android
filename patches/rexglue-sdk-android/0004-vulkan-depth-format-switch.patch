@@ -1,0 +1,29 @@
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..64b2758 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -37,6 +37,13 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_disable_depth_unorm24, false, "GPU/Vulkan",
++                    "Do not use the native D24 host depth format even when the GPU offers it, "
++                    "emulating guest depth with 32-bit float like GPUs without D24 (desktop "
++                    "NVIDIA) do. A diagnostic for depth-related artifacts on GPUs that have D24 "
++                    "(Adreno).")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -250,6 +257,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+                                           &depth_unorm24_properties);
+   depth_unorm24_vulkan_format_supported_ = (depth_unorm24_properties.optimalTilingFeatures &
+                                             kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
++  if (REXCVAR_GET(vulkan_disable_depth_unorm24)) {
++    // Take the path desktop NVIDIA GPUs take (they have no native D24): 32-bit float host depth.
++    depth_unorm24_vulkan_format_supported_ = false;
++  }
+   VkFormatProperties color_rg16_snorm_properties;
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_R16G16_SNORM,
+                                           &color_rg16_snorm_properties);

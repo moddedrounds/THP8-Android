@@ -1,0 +1,339 @@
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index bfcd400..85d1966 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -83,6 +83,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   // it waits for a vblank, so a vsync thread kept off the CPU (measured: up to 13 ms on Android
+   // under core_ctl) cannot delay one. With try_only, returns at once if a delivery is under way.
+   void DeliverDueVblanks(bool try_only);
++  // gpu_vblank_display_lock: moves the grid (by at most gpu_vblank_display_slew_us per vblank)
++  // towards the configured phase of the display refresh. Vsync thread only.
++  void LockVblankGridToDisplay();
+   // Time of the next vblank on the grid (or a default-constructed time point before it starts).
+   std::chrono::steady_clock::time_point NextVblankTime() const;
+ 
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..c81428c 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -51,6 +51,23 @@ namespace rex {
+ namespace ui {
+ 
+ class Presenter;
++
++// Display vsync timing reported by the platform (Android: AChoreographer frame callbacks, sent by
++// the app through the exported rex_ui_set_display_vsync): time of the latest vsync in
++// std::chrono::steady_clock nanoseconds and the refresh period. Get returns false while unknown or
++// stale (no report for 250 ms).
++void SetDisplayVsync(int64_t vsync_ns, int64_t period_ns);
++bool GetDisplayVsync(int64_t& vsync_ns, int64_t& period_ns);
++// Phase of `now_ns` within the display refresh, 0..1 (0 = at a vsync); -1 when unknown.
++float DisplayVsyncPhase(int64_t now_ns);
++// Smoothed (circular mean) display-refresh phases, 0..1, of the presenter's paints (when it takes
++// the newest guest frame) and of guest output refreshes. False until both have been seen.
++bool GetPresentPhases(float& paint_phase, float& refresh_phase);
++// Waits until the newest guest output handed to RefreshGuestOutput has been taken by a paint (or
++// the timeout passes); true if it was taken. For producers that hand over several frames in a row
++// (frame generation): with the UI thread painting at the display rate, the mailbox keeps only the
++// newest frame, so a frame handed over before the previous one was painted is never shown.
++bool WaitForGuestOutputConsumed(int64_t timeout_us);
+ class Window;
+ 
+ class UIDrawContext {
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index b408ae2..51c1c6b 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -31,6 +31,7 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
++#include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+@@ -46,6 +47,20 @@ REXCVAR_DEFINE_UINT32(gpu_vblank_hold_us, 0, "GPU",
+                       "then restarts from there. A frame that needs 18 ms then presents after 18 ms "
+                       "instead of waiting for the next 60 Hz vblank at 33.3 ms. 0 = fixed grid")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(gpu_vblank_display_lock, false, "GPU",
++                    "Phase-lock the guest 60 Hz vblank grid to the display's vsync (reported by the "
++                    "platform): every guest frame then reaches the presenter at the same point of a "
++                    "display refresh, instead of drifting across the moment the presenter picks the "
++                    "newest frame (repeated / never-shown frames at a steady 60)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_vblank_display_phase_pct, -1, "GPU",
++                     "gpu_vblank_display_lock: where in the display refresh the guest vblank goes, in "
++                     "percent of the refresh period after the display vsync; -1 = automatic: steer "
++                     "the guest frames to half a refresh away from where the presenter takes them")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_vblank_display_slew_us, 2000, "GPU",
++                     "gpu_vblank_display_lock: largest correction of one guest vblank, microseconds")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -199,6 +214,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+               vblanks_delivered_.store(0, std::memory_order_release);
+               vblank_grid_ready_.store(true, std::memory_order_release);
+             }
++            if (REXCVAR_GET(gpu_vblank_display_lock)) {
++              LockVblankGridToDisplay();
++            }
+             const auto edge = NextVblankTime();
+             const auto spin_from = edge - std::chrono::microseconds(REXCVAR_GET(vblank_spin_us));
+             if (spin_from > std::chrono::steady_clock::now()) {
+@@ -481,6 +499,49 @@ std::chrono::steady_clock::time_point GraphicsSystem::NextVblankTime() const {
+          vblank_interval_ * int64_t(vblanks_delivered_.load(std::memory_order_acquire) + 1);
+ }
+ 
++void GraphicsSystem::LockVblankGridToDisplay() {
++  int64_t vsync_ns, period_ns;
++  if (!ui::GetDisplayVsync(vsync_ns, period_ns)) {
++    return;
++  }
++  // Guest vblanks per display refresh: 60 Hz guest on a 60 Hz display = every refresh, on 120 Hz
++  // every second one (the target phase is then within a 2-refresh cycle).
++  const int64_t interval_ns =
++      std::chrono::duration_cast<std::chrono::nanoseconds>(vblank_interval_).count();
++  const int64_t k = std::max<int64_t>(1, (interval_ns + period_ns / 2) / period_ns);
++  const int64_t cycle_ns = k * period_ns;
++  const int64_t edge_ns = NextVblankTime().time_since_epoch().count();
++  // Automatic phase: the presenter takes the newest guest frame at a fairly fixed point of each
++  // refresh (paint phase); guest frames must reach it half a refresh away from that point. The
++  // vblank's phase is integrated towards where the measured refresh phase lands there (the swap
++  // follows the vblank by a few ms, so the vblank phase itself is not the target).
++  static double auto_phase = 0.2;
++  double phase = 0.0;
++  const int32_t fixed = REXCVAR_GET(gpu_vblank_display_phase_pct);
++  if (fixed >= 0) {
++    phase = std::min(fixed, 99) / 100.0;
++  } else {
++    float paint, refresh;
++    if (ui::GetPresentPhases(paint, refresh)) {
++      double err = double(paint) + 0.5 - double(refresh);
++      err -= std::floor(err + 0.5);  // -0.5..0.5
++      auto_phase += 0.02 * err;
++      auto_phase -= std::floor(auto_phase);
++    }
++    phase = auto_phase;
++  }
++  const int64_t target_offset = vsync_ns + int64_t(double(period_ns) * phase);
++  int64_t err = (target_offset - edge_ns) % cycle_ns;  // how much later the edge should be
++  if (err > cycle_ns / 2) err -= cycle_ns;
++  if (err < -cycle_ns / 2) err += cycle_ns;
++  const int64_t slew_ns = int64_t(std::max(0, REXCVAR_GET(gpu_vblank_display_slew_us))) * 1000;
++  const int64_t correction = std::clamp(err, -slew_ns, slew_ns);
++  if (correction) {
++    std::lock_guard<std::mutex> lock(vblank_delivery_mutex_);
++    vblank_epoch_.fetch_add(correction, std::memory_order_acq_rel);
++  }
++}
++
+ void GraphicsSystem::DeliverDueVblanks(bool try_only) {
+   if (!vblank_grid_ready_.load(std::memory_order_acquire)) {
+     return;
+diff --git a/src/graphics/vulkan/frame_generation.cpp b/src/graphics/vulkan/frame_generation.cpp
+index 4788645..786619e 100755
+--- a/src/graphics/vulkan/frame_generation.cpp
++++ b/src/graphics/vulkan/frame_generation.cpp
+@@ -16,6 +16,10 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_frame_generation_wait_paint, true, "GPU/Vulkan",
++                    "Frame generation pacer: hand the next frame to the presenter only after a paint "
++                    "took the previous one (one display refresh per frame)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(gpu_frame_generation_pixel_vectors, true, "GPU/Vulkan",
+                     "Frame generation: every pixel picks the best of its block's motion vector, the "
+                     "four neighbouring blocks' vectors and zero motion (static HUD stays sharp, "
+@@ -646,6 +650,13 @@ void FrameGenerator::PacerMain() {
+             context.SetIs8bpc(is_8bpc);
+             return CopyToPresenter(source, vulkan_context.image(), entry.width, entry.height);
+           });
++      // One display refresh per output frame: wait until a paint took this one before handing over
++      // the next (the UI thread paints the newest frame each refresh; back-to-back hand-overs left
++      // ~20 % of the frames never shown and as many refreshes repeating one). Bounded, so a stalled
++      // presenter cannot hold the pacer.
++      if (REXCVAR_GET(gpu_frame_generation_wait_paint)) {
++        ui::WaitForGuestOutputConsumed(40000);
++      }
+     }
+     {
+       std::lock_guard<std::mutex> lock(pacer_mutex_);
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index add9492..4a383e3 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -10,6 +10,11 @@
+  */
+ 
+ #include <algorithm>
++#include <condition_variable>
++#include <mutex>
++#include <cmath>
++#include <chrono>
++#include <string>
+ #include <atomic>
+ #include <cctype>
+ #include <utility>
+@@ -550,6 +555,89 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   }
+ }
+ 
++namespace {
++std::atomic<int64_t> g_display_vsync_ns{0}, g_display_period_ns{0};
++inline int64_t SteadyNowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++}  // namespace
++
++bool GetPresentPhases(float& paint_phase, float& refresh_phase);
++
++void SetDisplayVsync(int64_t vsync_ns, int64_t period_ns) {
++  g_display_period_ns.store(period_ns, std::memory_order_relaxed);
++  g_display_vsync_ns.store(vsync_ns, std::memory_order_release);
++}
++
++bool GetDisplayVsync(int64_t& vsync_ns, int64_t& period_ns) {
++  vsync_ns = g_display_vsync_ns.load(std::memory_order_acquire);
++  period_ns = g_display_period_ns.load(std::memory_order_relaxed);
++  return vsync_ns && period_ns > 1000000 && SteadyNowNs() - vsync_ns < 250000000;
++}
++
++float DisplayVsyncPhase(int64_t now_ns) {
++  int64_t vsync, period;
++  if (!GetDisplayVsync(vsync, period)) {
++    return -1.0f;
++  }
++  int64_t d = (now_ns - vsync) % period;
++  if (d < 0) d += period;
++  return float(double(d) / double(period));
++}
++
++namespace {
++// Presentation pacing counters (logged about every 10 s of painting): how many paints showed a new
++// guest frame, how many repeated the previous one, and how many guest frames were replaced in the
++// mailbox before any paint picked them up (never shown). With the UI thread painting at the display
++// rate (any UI drawer, e.g. the fps overlay) and the guest frames on their own clock, repeats and
++// never-shown frames are judder that the guest frame rate does not show.
++std::atomic<bool> g_pacing_ready_pending{false};
++std::atomic<uint64_t> g_pacing_refreshes{0}, g_pacing_dropped{0}, g_pacing_paints{0},
++    g_pacing_new{0};
++// Display-refresh phase histograms (10 bins) of paints (guest output consumed) and guest refreshes.
++std::atomic<uint32_t> g_phase_paint[10], g_phase_refresh[10];
++// Circular EMA of a phase as a unit vector (written by one thread each; read racily by the vsync
++// thread, which only steers by it).
++struct PhaseMean {
++  std::atomic<float> x{0.0f}, y{0.0f};
++  void Add(float phase) {
++    const float a = 0.05f;
++    const float angle = phase * 6.2831853f;
++    x.store(x.load(std::memory_order_relaxed) * (1.0f - a) + std::cos(angle) * a,
++            std::memory_order_relaxed);
++    y.store(y.load(std::memory_order_relaxed) * (1.0f - a) + std::sin(angle) * a,
++            std::memory_order_relaxed);
++  }
++  bool Get(float& phase) const {
++    const float fx = x.load(std::memory_order_relaxed), fy = y.load(std::memory_order_relaxed);
++    if (fx * fx + fy * fy < 1e-4f) return false;
++    phase = std::atan2(fy, fx) / 6.2831853f;
++    if (phase < 0.0f) phase += 1.0f;
++    return true;
++  }
++};
++PhaseMean g_mean_paint, g_mean_refresh;
++std::mutex g_consumed_mutex;
++std::condition_variable g_consumed_cv;
++inline void NotePhase(std::atomic<uint32_t>* bins) {
++  const float ph = DisplayVsyncPhase(SteadyNowNs());
++  if (ph >= 0.0f) {
++    bins[std::min(9, int(ph * 10.0f))].fetch_add(1, std::memory_order_relaxed);
++    (bins == g_phase_paint ? g_mean_paint : g_mean_refresh).Add(ph);
++  }
++}
++inline std::string TakePhases(std::atomic<uint32_t>* bins) {
++  std::string out;
++  for (int i = 0; i < 10; ++i) {
++    out += std::to_string(bins[i].exchange(0, std::memory_order_relaxed));
++    out += i < 9 ? "/" : "";
++  }
++  return out;
++}
++}  // namespace
++
+ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+@@ -596,6 +684,11 @@ bool Presenter::RefreshGuestOutput(
+       last_acquired_and_ready,
+       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
+       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
++  g_pacing_refreshes.fetch_add(1, std::memory_order_relaxed);
++  NotePhase(g_phase_refresh);
++  if (g_pacing_ready_pending.exchange(true, std::memory_order_acq_rel)) {
++    g_pacing_dropped.fetch_add(1, std::memory_order_relaxed);
++  }
+   // Now, it's known that `ready == writable` on the host presentation side.
+   // Take the next `writable` with this assumption about its current value in
+   // mind.
+@@ -803,9 +896,34 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+   return true;
+ }
+ 
++
+ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+     uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
+     GuestOutputPaintConfig* paint_config_out) {
++  if (paint_config_out) {
++    NotePhase(g_phase_paint);
++    const bool fresh = g_pacing_ready_pending.exchange(false, std::memory_order_acq_rel);
++    if (fresh) {
++      { std::lock_guard<std::mutex> lock(g_consumed_mutex); }
++      g_consumed_cv.notify_all();
++    }
++    const uint64_t paints = g_pacing_paints.fetch_add(1, std::memory_order_relaxed) + 1;
++    const uint64_t fresh_count =
++        g_pacing_new.fetch_add(fresh ? 1 : 0, std::memory_order_relaxed) + (fresh ? 1 : 0);
++    if (paints % 600 == 0) {
++      const uint64_t refreshes = g_pacing_refreshes.exchange(0, std::memory_order_relaxed);
++      const uint64_t dropped = g_pacing_dropped.exchange(0, std::memory_order_relaxed);
++      g_pacing_new.store(0, std::memory_order_relaxed);
++      int64_t vsync_ns, period_ns;
++      const bool have_vsync = GetDisplayVsync(vsync_ns, period_ns);
++      REXLOG_INFO("presenter pacing: 600 paints, {} new frames, {} repeats; {} guest frames, {} "
++                  "never shown; paint mode {}; display {:.3f} ms; refresh phase {} | paint "
++                  "phase {}",
++                  fresh_count, 600 - fresh_count, refreshes, dropped, int(paint_mode_),
++                  have_vsync ? period_ns / 1e6 : 0.0, TakePhases(g_phase_refresh),
++                  TakePhases(g_phase_paint));
++    }
++  }
+   if (paint_config_out) {
+     // Get the up-to-date guest output paint configuration settings set by the
+     // UI thread.
+@@ -1677,3 +1795,21 @@ void Presenter::DXGIUITickThread() {
+ 
+ }  // namespace ui
+ }  // namespace rex
++
++namespace rex::ui {
++bool GetPresentPhases(float& paint_phase, float& refresh_phase) {
++  return g_mean_paint.Get(paint_phase) && g_mean_refresh.Get(refresh_phase);
++}
++
++bool WaitForGuestOutputConsumed(int64_t timeout_us) {
++  std::unique_lock<std::mutex> lock(g_consumed_mutex);
++  return g_consumed_cv.wait_for(lock, std::chrono::microseconds(timeout_us), [] {
++    return !g_pacing_ready_pending.load(std::memory_order_acquire);
++  });
++}
++}  // namespace rex::ui
++
++extern "C" __attribute__((visibility("default"))) void rex_ui_set_display_vsync(int64_t vsync_ns,
++                                                                             int64_t period_ns) {
++  rex::ui::SetDisplayVsync(vsync_ns, period_ns);
++}

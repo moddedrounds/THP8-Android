@@ -1,0 +1,404 @@
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056..a27a370 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -14,6 +14,7 @@
+ #include "rex/system/function_dispatcher.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -77,6 +78,14 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+ 
++  // Delivers every guest vblank whose time has come (fixed 60 Hz grid) and that no thread has
++  // delivered yet. The vsync thread normally does it; the command processor also calls this while
++  // it waits for a vblank, so a vsync thread kept off the CPU (measured: up to 13 ms on Android
++  // under core_ctl) cannot delay one. With try_only, returns at once if a delivery is under way.
++  void DeliverDueVblanks(bool try_only);
++  // Time of the next vblank on the grid (or a default-constructed time point before it starts).
++  std::chrono::steady_clock::time_point NextVblankTime() const;
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -121,6 +130,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
+ 
++  std::mutex vblank_delivery_mutex_;
++  std::atomic<uint64_t> vblanks_delivered_{0};
++  std::chrono::steady_clock::time_point vblank_epoch_;
++  std::chrono::steady_clock::duration vblank_interval_{};
++  std::atomic<bool> vblank_grid_ready_{false};
++
+   RegisterFile register_file_;
+   std::unique_ptr<CommandProcessor> command_processor_;
+ 
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..fe55841 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -108,6 +108,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
+                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
+                uint32_t& written_length_out);
++  // The next Resolve performs its clears but not its copy (the destination keeps its contents).
++  void SkipNextResolveCopy() { skip_next_resolve_copy_ = true; }
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+@@ -879,6 +881,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   VkPipelineLayout resolve_fsi_clear_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipeline resolve_fsi_clear_32bpp_pipeline_ = VK_NULL_HANDLE;
+   VkPipeline resolve_fsi_clear_64bpp_pipeline_ = VK_NULL_HANDLE;
++  bool skip_next_resolve_copy_ = false;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
+index 4ac5a09..2b62675 100644
+--- a/include/rex/perf/counter.h
++++ b/include/rex/perf/counter.h
+@@ -172,6 +172,12 @@ enum class CounterId : uint16_t {
+   kCpRingIdleUs,
+   kCpRegMemWaitUs,
+   kCpCapWaitUs,
++  // CLOCK_MONOTONIC time of the swap in microseconds (aligns frames with simpleperf/perfetto traces).
++  kSwapTimeUs,
++  // Run-queue delay (runnable but not running, from schedstat) during the frame: command processor
++  // thread and guest vblank thread - shows when a pacing thread was preempted.
++  kCpRunqUs,
++  kVsyncRunqUs,
+ 
+   kCount  // sentinel -- must be last
+ };
+diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
+index 9cd3a4b..2b35257 100644
+--- a/src/core/perf/counter.cpp
++++ b/src/core/perf/counter.cpp
+@@ -81,6 +81,9 @@ constexpr const char* kCounterNames[] = {
+     "cp_ring_idle_us",
+     "cp_regmem_wait_us",
+     "cp_cap_wait_us",
++    "swap_time_us",
++    "cp_runq_us",
++    "vsync_runq_us",
+ };
+ static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
+ 
+@@ -136,6 +139,9 @@ constexpr bool kIsGauge[] = {
+     false,  // kCpRingIdleUs
+     false,  // kCpRegMemWaitUs
+     false,  // kCpCapWaitUs
++    false,  // kSwapTimeUs
++    false,  // kCpRunqUs
++    false,  // kVsyncRunqUs
+ };
+ static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index f4c8a66..cb4e447 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <atomic>
+ #include <chrono>
+ #include <cinttypes>
+@@ -164,6 +165,25 @@ void NoteGuestVblank() {
+   g_vblank_cv.notify_all();
+ }
+ 
++// Run-queue delay of the calling thread so far (schedstat field 2, ns).
++uint64_t ThreadRunqNs() {
++  uint64_t run = 0, wait = 0;
++  if (FILE* f = std::fopen("/proc/thread-self/schedstat", "r")) {
++    if (std::fscanf(f, "%" SCNu64 " %" SCNu64, &run, &wait) != 2) {
++      wait = 0;
++    }
++    std::fclose(f);
++  }
++  return wait;
++}
++std::atomic<uint64_t> g_vsync_runq_ns{0};
++void NoteVsyncRunq() {
++  thread_local uint64_t last = ThreadRunqNs();
++  const uint64_t now = ThreadRunqNs();
++  g_vsync_runq_ns.fetch_add(now - last, std::memory_order_relaxed);
++  last = now;
++}
++
+ bool PacingEnabled() {
+   static const bool enabled = REXCVAR_GET(gpu_pacing_trace);
+   return enabled;
+@@ -1409,8 +1429,16 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+       const auto cap_start = std::chrono::steady_clock::now();
+       // Sleep until ~1.5 ms before the target vblank, then spin (wakes after a sleep were measured
+       // 2-5 ms late on Android).
+-      const auto target_time = g_vblank_time + std::chrono::microseconds(16667) *
+-                                                   int64_t(target - g_vblank_count);
++      auto target_time = g_vblank_time + std::chrono::microseconds(16667) *
++                                             int64_t(target - g_vblank_count);
++      if (graphics_system_) {
++        // The shared 60 Hz grid: unaffected by a late delivery of the previous vblank.
++        const auto next = graphics_system_->NextVblankTime();
++        if (next.time_since_epoch().count()) {
++          target_time = next + std::chrono::microseconds(16667) *
++                                   int64_t(target - g_vblank_count - 1);
++        }
++      }
+       g_vblank_cv.wait_until(lock, target_time - std::chrono::microseconds(3000),
+                              [target] { return g_vblank_count >= target; });
+       const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+@@ -1418,6 +1446,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+       lock.unlock();
+       while (g_vblank_count.load(std::memory_order_acquire) < target &&
+              std::chrono::steady_clock::now() < spin_deadline) {
++        if (graphics_system_) {
++          graphics_system_->DeliverDueVblanks(true);
++        }
+       }
+       lock.lock();
+       g_vblank_cv.wait_for(lock, std::chrono::milliseconds(100),
+@@ -1448,6 +1479,20 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+     last_swap_vblank = g_vblank_count;
+   }
+   PacingTrace('S', 0);
++  {
++    timespec now_ts;
++    clock_gettime(CLOCK_MONOTONIC, &now_ts);
++    rex::perf::SetCounter(rex::perf::CounterId::kSwapTimeUs,
++                          int64_t(now_ts.tv_sec) * 1000000 + now_ts.tv_nsec / 1000);
++  }
++  {
++    static uint64_t last_runq = ThreadRunqNs();
++    const uint64_t runq = ThreadRunqNs();
++    rex::perf::SetCounter(rex::perf::CounterId::kCpRunqUs, int64_t((runq - last_runq) / 1000));
++    last_runq = runq;
++    rex::perf::SetCounter(rex::perf::CounterId::kVsyncRunqUs,
++                          int64_t(g_vsync_runq_ns.exchange(0, std::memory_order_relaxed) / 1000));
++  }
+   {
+     static uint32_t last_cpu_tenths = ThreadCpuTenthsMs();
+     const uint32_t cpu_tenths = ThreadCpuTenthsMs();
+@@ -1662,6 +1707,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         // inactive trace writer and ReturnFromWait is empty - so a short sleep
+         // gets the latency back without the spin.
+         constexpr auto kMaxPollWait = std::chrono::microseconds(125);
++        if (graphics_system_) {
++          graphics_system_->DeliverDueVblanks(true);  // a due vblank the vsync thread is late with
++        }
+         if (!REXCVAR_GET(vsync) || TimeToNextGuestVblank() < std::chrono::microseconds(1500)) {
+           // User wants it fast and dangerous - or a vblank (what these waits usually wait for) is
+           // imminent and a sleep could wake milliseconds late.
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 6ed0507..7ce4357 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -173,6 +173,26 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         auto next_wake = std::chrono::steady_clock::now();
+         while (vsync_worker_running_) {
+           bool vsync_on = REXCVAR_GET(vsync);
++          if (vsync_on) {
++            // Fixed 60 Hz grid shared with the command processor (DeliverDueVblanks).
++            if (!vblank_grid_ready_.load(std::memory_order_acquire)) {
++              vblank_interval_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                  std::chrono::duration<double>(1.0 / refresh_rate_hz));
++              vblank_epoch_ = std::chrono::steady_clock::now();
++              vblanks_delivered_.store(0, std::memory_order_release);
++              vblank_grid_ready_.store(true, std::memory_order_release);
++            }
++            const auto edge = NextVblankTime();
++            const auto spin_from = edge - std::chrono::microseconds(3000);
++            if (spin_from > std::chrono::steady_clock::now()) {
++              rex::thread::SleepUntil(spin_from);
++            }
++            while (std::chrono::steady_clock::now() < edge) {
++            }
++            DeliverDueVblanks(false);
++            continue;
++          }
++          vblank_grid_ready_.store(false, std::memory_order_release);
+           uint64_t interval_ticks = vsync_on ? vsync_interval_ticks : no_vsync_interval_ticks;
+           auto host_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+               std::chrono::duration<double>(vsync_on ? 1.0 / refresh_rate_hz : 0.001));
+@@ -398,6 +418,44 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+ void PacingTrace(char code, uint32_t arg);
+ bool PacingEnabled();
+ void NoteGuestVblank();
++void NoteVsyncRunq();
++
++std::chrono::steady_clock::time_point GraphicsSystem::NextVblankTime() const {
++  if (!vblank_grid_ready_.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return vblank_epoch_ +
++         vblank_interval_ * int64_t(vblanks_delivered_.load(std::memory_order_acquire) + 1);
++}
++
++void GraphicsSystem::DeliverDueVblanks(bool try_only) {
++  if (!vblank_grid_ready_.load(std::memory_order_acquire)) {
++    return;
++  }
++  const uint64_t due =
++      uint64_t((std::chrono::steady_clock::now() - vblank_epoch_) / vblank_interval_);
++  if (vblanks_delivered_.load(std::memory_order_acquire) >= due) {
++    return;
++  }
++  std::unique_lock<std::mutex> lock(vblank_delivery_mutex_, std::defer_lock);
++  if (try_only) {
++    if (!lock.try_lock()) {
++      return;  // Someone is delivering right now.
++    }
++  } else {
++    lock.lock();
++  }
++  uint64_t delivered = vblanks_delivered_.load(std::memory_order_acquire);
++  // After a long stall (suspend, debugger) deliver at most 4: never a burst of thousands.
++  if (due > delivered + 4) {
++    delivered = due - 4;
++  }
++  while (delivered < due) {
++    ++delivered;
++    vblanks_delivered_.store(delivered, std::memory_order_release);
++    MarkVblank();
++  }
++}
+ 
+ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+@@ -413,6 +471,7 @@ void GraphicsSystem::MarkVblank() {
+   //     needs to be run in the interrupt.
+   PacingTrace('V', 0);
+   NoteGuestVblank();
++  NoteVsyncRunq();
+   DispatchInterruptCallback(0, 2);
+   if (memory_ && PacingEnabled()) {
+     PacingTrace('f', *reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(0x1FCA3004)));
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 2780991..bb5dbc0 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -65,6 +65,12 @@ REXCVAR_DEFINE_BOOL(vulkan_completion_queries, true, "GPU/Vulkan",
+                     "kgsl backend becomes an unbounded kernel wait (the command processor then "
+                     "blocks on the GPU at every poll). Live flag 2048 turns it off for A/B.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(gpu_shadow_skip_level, 0, "GPU/Vulkan",
++                     "Shadow-map update skipping (quality trade): 0 off; 1 = the 1024 and 512 "
++                     "shadow targets update on alternate frames; 2 = each updates every 4th frame "
++                     "(staggered); 3 = every 16th. Skipped passes keep last update's contents. Live "
++                     "flags 8192 / 16384 force level 1 / 2.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(gpu_timestamp_queries, false, "GPU",
+                     "Measure GPU time per frame with a pair of Vulkan timestamp queries and "
+                     "publish it as the gpu_frame_us counter. Every other counter here is "
+@@ -173,6 +179,13 @@ struct PacingTimer {
+   }
+ };
+ 
++// Shadow-map skipping state (command processor thread only).
++uint64_t g_shadow_frame = 0;
++uint32_t g_shadow_seen_frames[2] = {};   // frames in which the 1024 / 512 targets were drawn
++uint64_t g_shadow_seen_last_frame[2] = {};
++bool g_shadow_in_skipped_pass = false;
++uint64_t g_shadow_skipped_draws = 0, g_shadow_drawn = 0;
++
+ uint32_t LiveDiagnosticFlags() {
+   static uint32_t countdown = 0;
+   static uint32_t flags = 0;
+@@ -2560,6 +2573,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                                        uint32_t frontbuffer_height) {
+   PacingTimer pacing_timer('X');
+   shared_memory_->OnFrameEnd();
++  ++g_shadow_frame;
++  if (g_shadow_frame % 900 == 0 && (g_shadow_skipped_draws || g_shadow_drawn)) {
++    REXGPU_INFO("shadow skip: {} drawn, {} skipped shadow-like draws over 900 frames",
++                g_shadow_drawn, g_shadow_skipped_draws);
++    g_shadow_drawn = g_shadow_skipped_draws = 0;
++  }
+   ++draw_census_swap_ordinal_;
+   if (LiveDiagnosticFlags() & 4u) {
+     FlushDrawHistogram(draw_census_swap_ordinal_);
+@@ -4513,6 +4532,48 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+   native_residency_->BeginDraw(!memexport_writes_possible);
+ 
++  // Shadow-map update skipping: shadow-like = 1x MSAA with a square 1024 or 512 window scissor.
++  {
++    int level = REXCVAR_GET(gpu_shadow_skip_level);
++    if (LiveDiagnosticFlags() & 8192u) {
++      level = 1;
++    } else if (LiveDiagnosticFlags() & 16384u) {
++      level = 2;
++    }
++    const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++    const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
++    const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
++    const uint32_t scissor_w = scissor_br.br_x - scissor_tl.tl_x;
++    const uint32_t scissor_h = scissor_br.br_y - scissor_tl.tl_y;
++    int shadow_size = -1;
++    if (surface_info.msaa_samples == xenos::MsaaSamples::k1X && scissor_w == scissor_h) {
++      shadow_size = scissor_w == 1024 ? 0 : (scissor_w == 512 ? 1 : -1);
++    }
++    if (shadow_size < 0) {
++      g_shadow_in_skipped_pass = false;
++    } else {
++      if (g_shadow_seen_last_frame[shadow_size] != g_shadow_frame) {
++        g_shadow_seen_last_frame[shadow_size] = g_shadow_frame;
++        ++g_shadow_seen_frames[shadow_size];
++      }
++      bool skip = false;
++      if (level > 0 && !memexport_writes_possible && !active_occlusion_query_.valid &&
++          g_shadow_seen_frames[0] > 30 && g_shadow_seen_frames[1] > 30) {
++        const uint64_t period = level == 1 ? 2 : (level == 2 ? 4 : 16);
++        // The two sizes are staggered so every frame costs about the same.
++        const uint64_t phase = shadow_size == 0 ? 0 : period / 2;
++        skip = (g_shadow_frame % period) != phase;
++      }
++      if (skip) {
++        g_shadow_in_skipped_pass = true;
++        ++g_shadow_skipped_draws;
++        return true;
++      }
++      g_shadow_in_skipped_pass = false;
++      ++g_shadow_drawn;
++    }
++  }
++
+   // Two iterations because a submission (even the current one - in which case
+   // it needs to be ended, and a new one must be started) may need to be awaited
+   // in case of a sampler count overflow, and if that happens, all subsystem
+@@ -5601,6 +5662,11 @@ bool VulkanCommandProcessor::IssueCopy() {
+     return false;
+   }
+ 
++  if (g_shadow_in_skipped_pass) {
++    // The pass's draws were skipped: keep the shadow map from its last update (clear only).
++    render_target_cache_->SkipNextResolveCopy();
++    g_shadow_in_skipped_pass = false;
++  }
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 4385115..00b948f 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1163,7 +1163,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ 
+   // Copying.
+   bool copied = false;
+-  if (resolve_info.copy_dest_extent_length) {
++  const bool skip_copy = skip_next_resolve_copy_;
++  skip_next_resolve_copy_ = false;
++  if (resolve_info.copy_dest_extent_length && !skip_copy) {
+     draw_util::ResolveCopyShaderConstants copy_shader_constants;
+     uint32_t copy_group_count_x, copy_group_count_y;
+     draw_util::ResolveCopyShaderIndex copy_shader =

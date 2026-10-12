@@ -1,0 +1,778 @@
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..2fec944 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -849,6 +849,35 @@ class Shader {
+   // All vertex bindings used in the shader.
+   const std::vector<VertexBinding>& vertex_bindings() const { return vertex_bindings_; }
+ 
++  // Native vertex fetch: which vertex fetches may read their words from Vulkan vertex attributes
++  // (fetched by the fixed-function vertex input from the shared memory buffer bound at the fetch
++  // constant's address) instead of loading them from the shared memory storage buffer. A fetch
++  // qualifies when its index is the untouched vertex index (r0.x as set up by the shader prologue,
++  // not written before - or never written at all if the shader has jumps, calls or loops), its
++  // binding has a non-zero stride, and its words fit one attribute. Computed with the ucode
++  // analysis. The indices of `attributes` are the order of the fetches with used results (which is
++  // also the order the translator processes them in) and are the attribute locations.
++  struct NativeVertexFetchLayout {
++    struct Binding {
++      uint32_t fetch_constant;
++      uint32_t stride_words;
++    };
++    struct Attribute {
++      // Index in `bindings`, or UINT32_MAX if this fetch keeps loading from the shared memory.
++      uint32_t binding = UINT32_MAX;
++      uint32_t first_word = 0;
++      uint32_t word_count = 0;
++      uint32_t offset_bytes = 0;
++    };
++    // Whether any attribute is native (and all host limits are met).
++    bool eligible = false;
++    std::vector<Binding> bindings;
++    std::vector<Attribute> attributes;
++  };
++  const NativeVertexFetchLayout& native_vertex_fetch_layout() const {
++    return native_vertex_fetch_layout_;
++  }
++
+   // All texture bindings used in the shader.
+   const std::vector<TextureBinding>& texture_bindings() const { return texture_bindings_; }
+ 
+@@ -1004,6 +1033,20 @@ class Shader {
+ 
+   std::string ucode_disassembly_;
+   std::vector<VertexBinding> vertex_bindings_;
++  // Per vertex fetch with used results, in ucode order: where its attribute is in vertex_bindings_
++  // and whether its index is the untouched vertex index.
++  struct VertexFetchOrderEntry {
++    uint32_t binding_index;
++    uint32_t attribute_index;
++    bool index_is_vertex_index;
++  };
++  std::vector<VertexFetchOrderEntry> vertex_fetch_order_;
++  // Whether r0.x (the vertex index on entry) has been written by an instruction so far.
++  bool r0x_written_ = false;
++  // For vfetch_mini: whether the last vfetch_full's index was the untouched vertex index.
++  bool last_vfetch_full_index_is_vertex_index_ = false;
++  NativeVertexFetchLayout native_vertex_fetch_layout_;
++  void ComputeNativeVertexFetchLayout();
+   std::vector<TextureBinding> texture_bindings_;
+   ConstantRegisterMap constant_register_map_ = {};
+   std::set<uint32_t> label_addresses_;
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dce3dbf..dede7b2 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
+     // prototyping stage (easier to do small granular updates with an
+     // incremental counter).
+-    static constexpr uint32_t kVersion = 12;
++    static constexpr uint32_t kVersion = 13;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+       // For domain host vertex shader types only, xenos::TessellationMode.
+       uint32_t tessellation_mode : 2;
++      // Shader::native_vertex_fetch_layout() attributes read from vertex inputs (kVertex only).
++      uint32_t native_vertex_fetch : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -897,6 +899,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+ 
+   // VS as VS only - int, or VS as compute (kMemExportCompute) only - uint3.
+   spv::Id input_vertex_index_;
++  // Native vertex fetch: per vertex fetch with used results (in ucode order), the uint / uvecN
++  // vertex input holding its words, or spv::NoResult if it loads from the shared memory.
++  std::vector<spv::Id> input_native_vertex_attributes_;
++  uint32_t native_vertex_fetch_index_ = 0;
+   // VS as TES only - int.
+   spv::Id input_primitive_id_;
+   // VS as TES only - float3.
+diff --git a/include/rex/graphics/primitive_processor.h b/include/rex/graphics/primitive_processor.h
+index 53287d5..c2a018c 100644
+--- a/include/rex/graphics/primitive_processor.h
++++ b/include/rex/graphics/primitive_processor.h
+@@ -147,6 +147,12 @@ class PrimitiveProcessor {
+     // only valid for index_buffer_type kHostConverted, kHostBuiltinForAuto and
+     // kHostBuiltinForDMA.
+     size_t host_index_buffer_handle;
++    // Native vertex fetch: the index buffer is kHostConverted with host-endian indices (no shader
++    // swap), and host_index_min / host_index_max are the smallest and largest index in it
++    // (excluding the reset index).
++    bool host_endian_indices;
++    uint32_t host_index_min;
++    uint32_t host_index_max;
+     bool IsTessellated() const {
+       return Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
+     }
+@@ -155,6 +161,9 @@ class PrimitiveProcessor {
+   virtual ~PrimitiveProcessor();
+ 
+   bool AreFull32BitVertexIndicesUsed() const { return full_32bit_vertex_indices_used_; }
++  // Native vertex fetch: for the next Process calls, convert guest DMA indices of kVertex draws to
++  // host-endian index buffers (ProcessingResult::host_endian_indices) where possible.
++  void SetHostEndianIndicesRequested(bool requested) { host_endian_indices_requested_ = requested; }
+   bool IsConvertingTriangleFansToLists() const { return convert_triangle_fans_to_lists_; }
+   bool IsConvertingLineLoopsToStrips() const { return convert_line_loops_to_strips_; }
+   // Quad lists may be emulated as line lists with adjacency and a geometry
+@@ -679,6 +688,7 @@ class PrimitiveProcessor {
+   SharedMemory& shared_memory_;
+ 
+   bool full_32bit_vertex_indices_used_ = false;
++  bool host_endian_indices_requested_ = false;
+   bool convert_triangle_fans_to_lists_ = false;
+   bool convert_line_loops_to_strips_ = false;
+   bool convert_quad_lists_to_triangle_lists_ = false;
+@@ -716,13 +726,15 @@ class PrimitiveProcessor {
+       // index conversion used by non-kVertex host vertex shader types on
+       // backends not supporting full 32-bit index fetch in this path.
+       uint32_t non_vertex_32bit_dma_to_24bit : 1;  // 60
++      // If set, entry is for the host-endian conversion for native vertex fetch.
++      uint32_t host_endian_for_native : 1;  // 61
+     };
+ 
+     CacheKey() : key(0) { static_assert_size(*this, sizeof(key)); }
+     CacheKey(uint32_t base, uint32_t count, xenos::IndexFormat format, xenos::Endian endian,
+              bool is_reset_enabled,
+              xenos::PrimitiveType conversion_guest_primitive_type = xenos::PrimitiveType::kNone,
+-             bool non_vertex_32bit_dma_to_24bit = false) {
++             bool non_vertex_32bit_dma_to_24bit = false, bool host_endian_for_native = false) {
+       // Clear unused bits, then set each field explicitly, not via the
+       // initializer list (which causes `uint64_t key = 0;` to be ignored, and
+       // also can't contain initializers for aliasing union members).
+@@ -734,6 +746,7 @@ class PrimitiveProcessor {
+       this->is_reset_enabled = is_reset_enabled;
+       this->conversion_guest_primitive_type = conversion_guest_primitive_type;
+       this->non_vertex_32bit_dma_to_24bit = non_vertex_32bit_dma_to_24bit;
++      this->host_endian_for_native = host_endian_for_native;
+     }
+ 
+     struct Hasher {
+@@ -756,6 +769,9 @@ class PrimitiveProcessor {
+     xenos::Endian host_shader_index_endian;
+     bool host_primitive_reset_enabled;
+     size_t host_index_buffer_handle;
++    bool host_endian_indices;
++    uint32_t host_index_min;
++    uint32_t host_index_max;
+   };
+ 
+   struct CacheEntry {
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index fe97e0c..4c30c76 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -717,6 +717,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   std::unique_ptr<VulkanTextureCache> texture_cache_;
+   std::unique_ptr<FrameGenerator> frame_generator_;
++  // Whether the draw being issued uses native vertex fetch (vertex buffers bound at the fetch
++  // constants' addresses, the guest base index moved to the host draw's vertex offset).
++  bool native_vertex_fetch_draw_ = false;
+   friend class FrameGenerator;
+ 
+   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..198311a 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -172,6 +172,8 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
+ }
+ 
+ void SpirvShaderTranslator::StartTranslation() {
++  input_native_vertex_attributes_.clear();
++  native_vertex_fetch_index_ = 0;
+   // TODO(Triang3l): Logger.
+   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
+                                             nullptr);
+@@ -1668,6 +1670,23 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+                                                    type_int_, "gl_VertexIndex");
+     builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
+     main_interface_.push_back(input_vertex_index_);
++    if (GetSpirvShaderModification().vertex.native_vertex_fetch) {
++      const Shader::NativeVertexFetchLayout& native_layout =
++          current_shader().native_vertex_fetch_layout();
++      input_native_vertex_attributes_.assign(native_layout.attributes.size(), spv::NoResult);
++      for (size_t i = 0; i < native_layout.attributes.size(); ++i) {
++        const Shader::NativeVertexFetchLayout::Attribute& attribute = native_layout.attributes[i];
++        if (attribute.binding == UINT32_MAX || !attribute.word_count) {
++          continue;
++        }
++        spv::Id attribute_variable = builder_->createVariable(
++            spv::NoPrecision, spv::StorageClassInput, type_uint_vectors_[attribute.word_count - 1],
++            fmt::format("xe_in_vfetch_{}", i).c_str());
++        builder_->addDecoration(attribute_variable, spv::DecorationLocation, int(i));
++        main_interface_.push_back(attribute_variable);
++        input_native_vertex_attributes_[i] = attribute_variable;
++      }
++    }
+   }
+ 
+   uint32_t output_location = 0;
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..3ccf392 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -31,6 +31,23 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+   uint32_t used_result_components = instr.result.GetUsedResultComponents();
+   uint32_t needed_words =
+       xenos::GetVertexFormatNeededWords(instr.attributes.data_format, used_result_components);
++
++  // Native vertex fetch: the words of this fetch may come from a vertex input (the order matches
++  // Shader::native_vertex_fetch_layout(), which counts the fetches with used results).
++  spv::Id native_attribute = spv::NoResult;
++  uint32_t native_first_word = 0, native_word_count = 0;
++  if (used_result_components) {
++    uint32_t native_index = native_vertex_fetch_index_++;
++    if (native_index < input_native_vertex_attributes_.size() &&
++        input_native_vertex_attributes_[native_index] != spv::NoResult) {
++      const Shader::NativeVertexFetchLayout::Attribute& attribute =
++          current_shader().native_vertex_fetch_layout().attributes[native_index];
++      native_attribute = input_native_vertex_attributes_[native_index];
++      native_first_word = attribute.first_word;
++      native_word_count = attribute.word_count;
++    }
++  }
++  spv::Id native_value = spv::NoResult;
+   // If this is vfetch_full, the address may still be needed for vfetch_mini -
+   // don't exit before calculating the address.
+   if (!needed_words && instr.is_mini_fetch) {
+@@ -123,6 +140,17 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+     // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
+     // P705), however, words (not full elements) out of glBufferData bounds
+     // contain 0.
++    if (native_attribute != spv::NoResult && word_index >= native_first_word &&
++        word_index < native_first_word + native_word_count) {
++      if (native_value == spv::NoResult) {
++        native_value = builder_->createLoad(native_attribute, spv::NoPrecision);
++      }
++      word_composite_constituents[word_count++] =
++          native_word_count > 1 ? builder_->createCompositeExtract(native_value, type_uint_,
++                                                                   word_index - native_first_word)
++                                : native_value;
++      continue;
++    }
+     word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+   }
+   spv::Id words;
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..92bcb3a 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -310,6 +310,10 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+     }
+   }
+ 
++  if (type() == xenos::ShaderType::kVertex) {
++    ComputeNativeVertexFetchLayout();
++  }
++
+   is_ucode_analyzed_ = true;
+ 
+   // An empty shader can be created internally by shader translators as a dummy,
+@@ -385,6 +389,27 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+     }
+   }
+ 
++  // Native vertex fetch: the index (read by vfetch_full, reused by its vfetch_mini) must be the
++  // untouched vertex index in r0.x.
++  bool index_is_vertex_index;
++  if (fetch_instr.is_mini_fetch) {
++    index_is_vertex_index = last_vfetch_full_index_is_vertex_index_;
++  } else {
++    const InstructionOperand& index_operand = fetch_instr.operands[0];
++    index_is_vertex_index =
++        !r0x_written_ && index_operand.storage_source == InstructionStorageSource::kRegister &&
++        index_operand.storage_index == 0 &&
++        index_operand.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
++        !index_operand.is_negated && !index_operand.is_absolute_value &&
++        index_operand.components[0] == SwizzleSource::kX;
++    last_vfetch_full_index_is_vertex_index_ = index_is_vertex_index;
++  }
++  if ((fetch_instr.result.GetUsedWriteMask() & 0b0001) &&
++      (fetch_instr.result.storage_index == 0 ||
++       fetch_instr.result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute)) {
++    r0x_written_ = true;
++  }
++
+   // Don't bother setting up a binding for an instruction that fetches nothing.
+   // In case of vfetch_full, however, it may still be used to set up addressing
+   // for the subsequent vfetch_mini, so operand information must still be
+@@ -420,6 +445,81 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+ 
+   // Populate attribute.
+   attrib->fetch_instr = fetch_instr;
++
++  for (const VertexBinding& vertex_binding : vertex_bindings_) {
++    if (vertex_binding.fetch_constant == op.fetch_constant_index()) {
++      vertex_fetch_order_.push_back({uint32_t(vertex_binding.binding_index),
++                                     uint32_t(vertex_binding.attributes.size() - 1),
++                                     index_is_vertex_index});
++      break;
++    }
++  }
++}
++
++void Shader::ComputeNativeVertexFetchLayout() {
++  NativeVertexFetchLayout& layout = native_vertex_fetch_layout_;
++  layout = NativeVertexFetchLayout();
++  layout.attributes.resize(vertex_fetch_order_.size());
++  // With jumps, calls or loops, code before a write to r0.x may run again after it.
++  if (r0x_written_ && !label_addresses_.empty()) {
++    return;
++  }
++  // Conservative limits that every Vulkan implementation supports.
++  constexpr uint32_t kMaxBindings = 16, kMaxAttributes = 16, kMaxOffset = 2047, kMaxStride = 2048;
++  std::vector<uint32_t> layout_binding_of(vertex_bindings_.size(), UINT32_MAX);
++  uint32_t native_count = 0;
++  for (size_t i = 0; i < vertex_fetch_order_.size(); ++i) {
++    const VertexFetchOrderEntry& entry = vertex_fetch_order_[i];
++    if (!entry.index_is_vertex_index || entry.binding_index >= vertex_bindings_.size()) {
++      continue;
++    }
++    const VertexBinding& binding = vertex_bindings_[entry.binding_index];
++    if (entry.attribute_index >= binding.attributes.size()) {
++      continue;
++    }
++    const ParsedVertexFetchInstruction& fetch = binding.attributes[entry.attribute_index].fetch_instr;
++    uint32_t stride = fetch.attributes.stride;
++    if (!stride || stride != binding.stride_words || stride * 4 > kMaxStride) {
++      continue;
++    }
++    uint32_t needed_words = xenos::GetVertexFormatNeededWords(
++        fetch.attributes.data_format, fetch.result.GetUsedResultComponents());
++    if (!needed_words) {
++      continue;
++    }
++    uint32_t first_word = 0, last_word = 0;
++    rex::bit_scan_forward(needed_words, &first_word);
++    for (uint32_t w = 0; w < 32; ++w) {
++      if (needed_words & (uint32_t(1) << w)) {
++        last_word = w;
++      }
++    }
++    uint32_t word_count = last_word - first_word + 1;
++    int32_t offset_words = fetch.attributes.offset + int32_t(first_word);
++    if (word_count > 4 || offset_words < 0 || uint32_t(offset_words) * 4 > kMaxOffset) {
++      continue;
++    }
++    uint32_t& layout_binding = layout_binding_of[entry.binding_index];
++    if (layout_binding == UINT32_MAX) {
++      layout_binding = uint32_t(layout.bindings.size());
++      layout.bindings.push_back({binding.fetch_constant, stride});
++    }
++    NativeVertexFetchLayout::Attribute& attribute = layout.attributes[i];
++    attribute.binding = layout_binding;
++    attribute.first_word = first_word;
++    attribute.word_count = word_count;
++    attribute.offset_bytes = uint32_t(offset_words) * 4;
++    ++native_count;
++  }
++  if (!native_count || layout.bindings.size() > kMaxBindings ||
++      layout.attributes.size() > kMaxAttributes) {
++    layout.bindings.clear();
++    for (NativeVertexFetchLayout::Attribute& attribute : layout.attributes) {
++      attribute = NativeVertexFetchLayout::Attribute();
++    }
++    return;
++  }
++  layout.eligible = true;
+ }
+ 
+ void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
+@@ -566,6 +666,11 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
+       } else {
+         uses_register_dynamic_addressing_ = true;
+       }
++      if ((used_write_mask & 0b0001) &&
++          (result.storage_index == 0 ||
++           result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute)) {
++        r0x_written_ = true;
++      }
+       break;
+     case InstructionStorageTarget::kInterpolator:
+       writes_interpolators_ |= uint32_t(1) << result.storage_index;
+diff --git a/src/graphics/primitive_processor.cpp b/src/graphics/primitive_processor.cpp
+index 3a68749..dfa90bc 100644
+--- a/src/graphics/primitive_processor.cpp
++++ b/src/graphics/primitive_processor.cpp
+@@ -429,6 +429,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+   cacheable.host_draw_vertex_count = guest_draw_vertex_count;
+   cacheable.host_primitive_reset_enabled = false;
+   cacheable.host_index_buffer_handle = SIZE_MAX;
++  cacheable.host_endian_indices = false;
++  cacheable.host_index_min = 0;
++  cacheable.host_index_max = 0;
+   if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+       host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+     // As two-triangle strips, with guest indices being either autogenerated or
+@@ -765,6 +768,88 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+       // (for backends not supporting full 32-bit indices, thus unable to
+       // endian-swap, or even to safely drop the upper 8 bits if no swap is even
+       // needed) indirectly.
++      // Native vertex fetch: the fixed-function vertex input fetches the vertices with the host
++      // index, so it must be host-endian (the shader can't swap it there). Converted once per frame
++      // per index range, replacing the guest reset index with the host one; the index range is
++      // recorded for the guest index clamp check. If it can't be done, the usual path follows.
++      bool native_converted = false;
++      if (host_endian_indices_requested_ &&
++          host_vertex_shader_type == Shader::HostVertexShaderType::kVertex) {
++        CacheTransaction native_transaction(
++            *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
++                            guest_index_endian, guest_primitive_reset_enabled,
++                            xenos::PrimitiveType::kNone, false, true));
++        if (native_transaction.GetFoundResult()) {
++          if (native_transaction.GetFoundResult()->host_endian_indices) {
++            cacheable = *native_transaction.GetFoundResult();
++            native_converted = true;
++          }
++        } else {
++          CachedResult native_result = cacheable;
++          native_result.host_endian_indices = false;
++          size_t handle = SIZE_MAX;
++          void* host_indices_ptr = RequestHostConvertedIndexBufferForCurrentFrame(
++              guest_index_format, guest_draw_vertex_count, true, guest_index_base, handle);
++          if (host_indices_ptr) {
++            uint32_t index_min = UINT32_MAX, index_max = 0;
++            bool ok = true;
++            if (guest_index_format == xenos::IndexFormat::kInt16) {
++              auto guest_indices = memory_.TranslatePhysical<const uint16_t*>(guest_index_base);
++              auto host_indices = reinterpret_cast<uint16_t*>(host_indices_ptr);
++              const uint16_t reset_index = uint16_t(guest_primitive_reset_index_guest_endian);
++              for (uint32_t i = 0; i < guest_draw_vertex_count; ++i) {
++                uint16_t raw = guest_indices[i];
++                if (guest_primitive_reset_enabled && raw == reset_index) {
++                  host_indices[i] = UINT16_MAX;
++                  continue;
++                }
++                uint16_t index = xenos::GpuSwap(raw, guest_index_endian);
++                if (guest_primitive_reset_enabled && index == UINT16_MAX) {
++                  // A real vertex index colliding with the host reset index.
++                  ok = false;
++                  break;
++                }
++                host_indices[i] = index;
++                index_min = std::min(index_min, uint32_t(index));
++                index_max = std::max(index_max, uint32_t(index));
++              }
++            } else {
++              auto guest_indices = memory_.TranslatePhysical<const uint32_t*>(guest_index_base);
++              auto host_indices = reinterpret_cast<uint32_t*>(host_indices_ptr);
++              for (uint32_t i = 0; i < guest_draw_vertex_count; ++i) {
++                uint32_t raw = guest_indices[i];
++                if (guest_primitive_reset_enabled &&
++                    (raw & guest_index_mask_guest_endian) ==
++                        guest_primitive_reset_index_guest_endian) {
++                  host_indices[i] = UINT32_MAX;
++                  continue;
++                }
++                uint32_t index = xenos::GpuSwap(raw, guest_index_endian);
++                host_indices[i] = index;
++                index_min = std::min(index_min, index);
++                index_max = std::max(index_max, index);
++              }
++            }
++            if (ok && index_min <= index_max) {
++              native_result.host_draw_vertex_count = guest_draw_vertex_count;
++              native_result.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
++              native_result.host_index_format = guest_index_format;
++              native_result.host_shader_index_endian = xenos::Endian::kNone;
++              native_result.host_primitive_reset_enabled = guest_primitive_reset_enabled;
++              native_result.host_index_buffer_handle = handle;
++              native_result.host_endian_indices = true;
++              native_result.host_index_min = index_min;
++              native_result.host_index_max = index_max;
++            }
++          }
++          native_transaction.SetNewResult(native_result);
++          if (native_result.host_endian_indices) {
++            cacheable = native_result;
++            native_converted = true;
++          }
++        }
++      }
++      if (!native_converted) {
+       cacheable.host_draw_vertex_count = guest_draw_vertex_count;
+       cacheable.index_buffer_type = ProcessedIndexBufferType::kGuestDMA;
+       cacheable.host_primitive_reset_enabled = guest_primitive_reset_enabled;
+@@ -903,6 +988,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+           cache_transaction.SetNewResult(cacheable);
+         }
+       }
++
++      }  // !native_converted
+     }
+   }
+ 
+@@ -957,6 +1044,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+   result_out.host_shader_index_endian = cacheable.host_shader_index_endian;
+   result_out.host_primitive_reset_enabled = cacheable.host_primitive_reset_enabled;
+   result_out.host_index_buffer_handle = cacheable.host_index_buffer_handle;
++  result_out.host_endian_indices = cacheable.host_endian_indices;
++  result_out.host_index_min = cacheable.host_index_min;
++  result_out.host_index_max = cacheable.host_index_max;
+   return true;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9bab8c6..8d54a2a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -66,6 +66,12 @@ REXCVAR_DEFINE_BOOL(vulkan_completion_queries, true, "GPU/Vulkan",
+                     "kgsl backend becomes an unbounded kernel wait (the command processor then "
+                     "blocks on the GPU at every poll). Live flag 2048 turns it off for A/B.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++std::atomic<uint64_t> g_nvf_swap_count{0};
++REXCVAR_DEFINE_BOOL(gpu_native_vertex_fetch, false, "GPU/Vulkan",
++                    "Read vertex shader inputs through Vulkan vertex attributes (fixed-function vertex "
++                    "fetch from the shared memory buffer) instead of storage buffer loads, for the "
++                    "fetches and draws where the result is identical (live flag 32768 inverts)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(gpu_frame_generation, false, "GPU/Vulkan",
+                     "Frame generation: at every swap also present a motion-compensated frame halfway "
+                     "between the previous and the current guest frame, so a 30 fps game is shown at "
+@@ -2618,6 +2624,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   // per-frame reset above and ahead of everything the guest can observe, so
+   // that the swap tail itself is not touched and so that the mode still gets
+   // latched on the paths below that return early.
++  g_nvf_swap_count.fetch_add(1, std::memory_order_relaxed);
+   native_residency_->LatchFrameModeAtSwap();
+ 
+   if (draw_census::HasPendingRequest() ||
+@@ -4675,6 +4682,39 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  // Native vertex fetch statistics (logged every 300 swaps): draws, with an eligible shader, native,
++  // and why eligible draws were not native.
++  static uint64_t g_nvf_draws = 0, g_nvf_eligible = 0, g_nvf_native = 0, g_nvf_no_type = 0,
++                  g_nvf_no_range = 0, g_nvf_clamped = 0, g_nvf_memexport = 0;
++  ++g_nvf_draws;
++  if (vertex_shader->native_vertex_fetch_layout().eligible) {
++    ++g_nvf_eligible;
++    if (memexport_used_vertex) {
++      ++g_nvf_memexport;
++    }
++  }
++  {
++    static uint64_t g_nvf_last_swap = 0;
++    uint64_t swaps = g_nvf_swap_count.load(std::memory_order_relaxed);
++    if (swaps >= g_nvf_last_swap + 300) {
++      g_nvf_last_swap = swaps;
++      REXGPU_INFO("native vertex fetch: {} draws, {} eligible shaders, {} native; not native: {} "
++                  "index type, {} index range unknown, {} clamped/masked, {} memexport",
++                  g_nvf_draws, g_nvf_eligible, g_nvf_native, g_nvf_no_type, g_nvf_no_range,
++                  g_nvf_clamped, g_nvf_memexport);
++      g_nvf_draws = g_nvf_eligible = g_nvf_native = g_nvf_no_type = g_nvf_no_range =
++          g_nvf_clamped = g_nvf_memexport = 0;
++    }
++  }
++  // Native vertex fetch: needs host-endian indices from the primitive processor.
++  const Shader::NativeVertexFetchLayout& native_vertex_fetch_layout =
++      vertex_shader->native_vertex_fetch_layout();
++  const bool native_vertex_fetch_wanted =
++      (REXCVAR_GET(gpu_native_vertex_fetch) != ((LiveDiagnosticFlags() & 32768u) != 0)) &&
++      native_vertex_fetch_layout.eligible && !memexport_used_vertex;
++  primitive_processor_->SetHostEndianIndicesRequested(native_vertex_fetch_wanted);
++  native_vertex_fetch_draw_ = false;
++
+   // Two iterations because a submission (even the current one - in which case
+   // it needs to be ended, and a new one must be started) may need to be awaited
+   // in case of a sampler count overflow, and if that happens, all subsystem
+@@ -4753,6 +4793,65 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+         ps_param_gen_pos != UINT32_MAX);
++    // Native vertex fetch only where the fixed-function fetch reads exactly the vertices the
++    // shader would: host-endian or automatic indices, and the guest index (index + base, 24-bit
++    // masked, clamped to VGT_MIN/MAX_VTX_INDX) never actually masked or clamped.
++    native_vertex_fetch_draw_ = false;
++    if (native_vertex_fetch_wanted &&
++        primitive_processing_result.host_vertex_shader_type ==
++            Shader::HostVertexShaderType::kVertex &&
++        primitive_processing_result.guest_primitive_type != xenos::PrimitiveType::kLineLoop) {
++      bool range_known = false;
++      int64_t index_min = 0, index_max = 0;
++      if (primitive_processing_result.index_buffer_type ==
++          PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
++        range_known = true;
++        index_max = int64_t(primitive_processing_result.host_draw_vertex_count) - 1;
++      } else if (primitive_processing_result.index_buffer_type ==
++                     PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted &&
++                 primitive_processing_result.host_endian_indices) {
++        range_known = true;
++        index_min = primitive_processing_result.host_index_min;
++        index_max = primitive_processing_result.host_index_max;
++      }
++      if (primitive_processing_result.host_vertex_shader_type !=
++          Shader::HostVertexShaderType::kVertex) {
++        ++g_nvf_no_type;
++      } else if (!range_known) {
++        ++g_nvf_no_range;
++        static uint64_t g_nvf_kinds[8][32] = {};
++        static uint64_t g_nvf_kind_total = 0;
++        ++g_nvf_kinds[uint32_t(primitive_processing_result.index_buffer_type) & 7]
++                     [uint32_t(primitive_processing_result.guest_primitive_type) & 31];
++        if (++g_nvf_kind_total % 200000 == 0) {
++          std::string kinds;
++          for (uint32_t t = 0; t < 8; ++t) {
++            for (uint32_t pt = 0; pt < 32; ++pt) {
++              if (g_nvf_kinds[t][pt]) {
++                kinds += fmt::format(" ib{}/prim{}/fmt{}:{}", t, pt,
++                                     uint32_t(primitive_processing_result.host_index_format),
++                                     g_nvf_kinds[t][pt]);
++              }
++            }
++          }
++          REXGPU_INFO("native vertex fetch: index range unknown for{}", kinds);
++        }
++      }
++      if (range_known) {
++        const int64_t base = regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
++        const int64_t low = index_min + base, high = index_max + base;
++        native_vertex_fetch_draw_ =
++            low >= 0 && low >= int64_t(regs.Get<uint32_t>(XE_GPU_REG_VGT_MIN_VTX_INDX)) &&
++            high <= int64_t(regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX)) &&
++            high <= int64_t(xenos::kVertexIndexMask);
++        if (native_vertex_fetch_draw_) {
++          ++g_nvf_native;
++        } else {
++          ++g_nvf_clamped;
++        }
++      }
++    }
++    vertex_shader_modification.vertex.native_vertex_fetch = uint32_t(native_vertex_fetch_draw_);
+     pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+                                                    *pixel_shader, interpolator_mask,
+                                                    ps_param_gen_pos, normalized_depth_control)
+@@ -5377,6 +5476,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   };
+ 
++  // Native vertex fetch: bind the shared memory buffer at each binding's fetch constant address.
++  int32_t native_base_index = 0;
++  if (native_vertex_fetch_draw_) {
++    const auto& native_bindings = native_vertex_fetch_layout.bindings;
++    VkBuffer native_buffers[16];
++    VkDeviceSize native_offsets[16];
++    uint32_t native_binding_count = uint32_t(std::min<size_t>(native_bindings.size(), 16));
++    for (uint32_t binding_index = 0; binding_index < native_binding_count; ++binding_index) {
++      native_buffers[binding_index] = shared_memory_->buffer();
++      native_offsets[binding_index] =
++          VkDeviceSize(regs.GetVertexFetch(native_bindings[binding_index].fetch_constant).address)
++          << 2;
++    }
++    if (native_binding_count) {
++      deferred_command_buffer_.CmdVkBindVertexBuffers(0, native_binding_count, native_buffers,
++                                                      native_offsets);
++    }
++    native_base_index = regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
++  }
++
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+@@ -5389,7 +5508,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     commit_census_draw();
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1,
++                                       uint32_t(native_base_index), 0);
+     if (LiveDiagnosticFlags() & (32u | 64u)) {
+       // 32: two extra identical draws. 64: the same, but with a 1x1 scissor (no fragments).
+       const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
+@@ -5463,7 +5583,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+-                                              0, 0, 0);
++                                              0, native_base_index, 0);
+     if (LiveDiagnosticFlags() & (32u | 64u)) {
+       const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
+       if (tiny) {
+@@ -7721,7 +7841,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+            primitive_processing_result.line_loop_closing_index;
+   system_constants_.line_loop_closing_index = primitive_processing_result.line_loop_closing_index;
+ 
+-  // Vertex index offset.
++  // Vertex index offset (native vertex fetch: in the host draw's vertex offset instead).
++  if (native_vertex_fetch_draw_) {
++    vgt_indx_offset = 0;
++  }
+   dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
+   system_constants_.vertex_base_index = vgt_indx_offset;
+ 
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 9136d0c..d250533 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -3227,6 +3227,38 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+ 
+   VkPipelineVertexInputStateCreateInfo vertex_input_state = {};
+   vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++  // Native vertex fetch: one binding per fetch constant (bound at draw time at the fetch
++  // constant's address in the shared memory buffer), raw 32-bit words as attributes.
++  std::vector<VkVertexInputBindingDescription> native_vertex_bindings;
++  std::vector<VkVertexInputAttributeDescription> native_vertex_attributes;
++  if (SpirvShaderTranslator::Modification(description.vertex_shader_modification)
++          .vertex.native_vertex_fetch) {
++    const Shader::NativeVertexFetchLayout& native_layout =
++        creation_arguments.vertex_shader->shader().native_vertex_fetch_layout();
++    for (size_t i = 0; i < native_layout.bindings.size(); ++i) {
++      VkVertexInputBindingDescription& binding = native_vertex_bindings.emplace_back();
++      binding.binding = uint32_t(i);
++      binding.stride = native_layout.bindings[i].stride_words * 4;
++      binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++    }
++    static const VkFormat kWordFormats[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT,
++                                            VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32A32_UINT};
++    for (size_t i = 0; i < native_layout.attributes.size(); ++i) {
++      const Shader::NativeVertexFetchLayout::Attribute& source = native_layout.attributes[i];
++      if (source.binding == UINT32_MAX || !source.word_count) {
++        continue;
++      }
++      VkVertexInputAttributeDescription& attribute = native_vertex_attributes.emplace_back();
++      attribute.location = uint32_t(i);
++      attribute.binding = source.binding;
++      attribute.format = kWordFormats[source.word_count - 1];
++      attribute.offset = source.offset_bytes;
++    }
++    vertex_input_state.vertexBindingDescriptionCount = uint32_t(native_vertex_bindings.size());
++    vertex_input_state.pVertexBindingDescriptions = native_vertex_bindings.data();
++    vertex_input_state.vertexAttributeDescriptionCount = uint32_t(native_vertex_attributes.size());
++    vertex_input_state.pVertexAttributeDescriptions = native_vertex_attributes.data();
++  }
+ 
+   VkPipelineInputAssemblyStateCreateInfo input_assembly_state;
+   input_assembly_state.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 42c8655..fbc02e6 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -80,8 +80,10 @@ bool VulkanSharedMemory::Initialize() {
+   buffer_create_info.pNext = nullptr;
+   buffer_create_info.flags = sparse_flags;
+   buffer_create_info.size = kBufferSize;
++  // Vertex buffer: native vertex fetch binds it at the vertex fetch constants' addresses.
+   buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
++                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   buffer_create_info.queueFamilyIndexCount = 0;
+   buffer_create_info.pQueueFamilyIndices = nullptr;
+@@ -593,7 +595,8 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
+       break;
+   }
+   stage_mask = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | guest_shader_pipeline_stages_;
+-  access_mask = VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
++  access_mask =
++      VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+   switch (usage) {
+     case Usage::kRead:
+       stage_mask |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;

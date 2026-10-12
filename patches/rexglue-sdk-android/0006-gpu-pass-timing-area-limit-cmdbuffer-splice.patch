@@ -1,0 +1,603 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index dda72fc..339fd02 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -810,6 +810,18 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Frame number occupying each slot, or 0 when the slot holds nothing.
+   uint64_t timestamp_slot_frame_[kMaxFramesInFlight] = {};
+ 
++  // Per-pass GPU timing (gpu_pass_timing): a timestamp at every render pass begin and end, tagged
++  // with the call site that ended the pass; harvested and aggregated into the log.
++  static constexpr uint32_t kPassTimestampsPerFrame = 4096;
++  VkQueryPool pass_ts_pool_ = VK_NULL_HANDLE;
++  uint32_t pass_ts_count_[kMaxFramesInFlight] = {};
++  uint64_t pass_ts_slot_frame_[kMaxFramesInFlight] = {};
++  std::vector<uint32_t> pass_ts_tags_[kMaxFramesInFlight];
++  void PassTimestamp(uint32_t tag);
++  uint32_t PassTimingSiteId(const char* file, uint32_t line);
++  void PassTimingHarvest();
++  void FinalizePassRenderArea();
++
+   VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
+   VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
+   VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 16a21f6..38a7586 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -14,6 +14,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <type_traits>
+ #include <vector>
+ 
+ #include <rex/assert.h>
+@@ -32,20 +33,37 @@ class DeferredCommandBuffer {
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
+ 
++  // Render area limiting (tiled GPUs load and store every attachment of a pass over its render
++  // area): the area of the pass begun at begin_position is shrunk to the union of the scissors
++  // that were active while it was recorded (32-pixel aligned). Returns the covered fraction.
++  float LimitRenderPassArea(size_t begin_position, VkExtent2D full_extent);
++
+   // Where the next command will be written (in stream elements). Only meaningful for MoveTailTo.
+   size_t Position() const { return command_stream_.size(); }
+   // Moves the commands written since tail_start to destination (destination <= tail_start), keeping
+   // their order and the order of everything else. Commands carry their own size and no absolute
+   // offsets, so this is safe as long as both positions are command boundaries.
+   void MoveTailTo(size_t tail_start, size_t destination) {
+-    std::rotate(command_stream_.begin() + std::ptrdiff_t(destination),
+-                command_stream_.begin() + std::ptrdiff_t(tail_start), command_stream_.end());
++    // The tail (an upload block) is small, the part it moves in front of can be a whole pass:
++    // copy the tail aside and memmove the rest, instead of std::rotate over everything per upload.
++    const size_t tail_size = command_stream_.size() - tail_start;
++    if (!tail_size || destination >= tail_start) {
++      return;
++    }
++    using Element = std::remove_reference_t<decltype(command_stream_[0])>;
++    move_tail_scratch_.assign(command_stream_.begin() + std::ptrdiff_t(tail_start),
++                              command_stream_.end());
++    Element* base = command_stream_.data();
++    std::memmove(base + destination + tail_size, base + destination,
++                 (tail_start - destination) * sizeof(Element));
++    std::memcpy(base + destination, move_tail_scratch_.data(), tail_size * sizeof(Element));
+   }
+ 
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                             VkSubpassContents contents) {
+     assert_null(render_pass_begin->pNext);
++    BeginPassAreaTracking();
+     size_t arguments_size = sizeof(ArgsVkBeginRenderPass);
+     uint32_t clear_value_count = render_pass_begin->clearValueCount;
+     size_t clear_values_offset = 0;
+@@ -131,6 +149,7 @@ class DeferredCommandBuffer {
+ 
+   void CmdClearAttachmentsEmplace(uint32_t attachment_count, VkClearAttachment*& attachments_out,
+                                   uint32_t rect_count, VkClearRect*& rects_out) {
++    pass_area_unlimited_ = true;  // Clear rects are not tracked: keep the whole area for this pass.
+     size_t arguments_size = rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
+     size_t attachments_offset = arguments_size;
+     arguments_size = rex::align(arguments_size + sizeof(VkClearAttachment) * attachment_count,
+@@ -334,6 +353,9 @@ class DeferredCommandBuffer {
+     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+         WriteCommand(Command::kVkSetScissor, header_size + sizeof(VkRect2D) * scissor_count));
+     auto& args = *reinterpret_cast<ArgsVkSetScissor*>(args_ptr);
++    for (uint32_t i = 0; i < scissor_count; ++i) {
++      NoteScissor(scissors[i]);
++    }
+     args.first_scissor = first_scissor;
+     args.scissor_count = scissor_count;
+     std::memcpy(args_ptr + header_size, scissors, sizeof(VkRect2D) * scissor_count);
+@@ -610,6 +632,44 @@ class DeferredCommandBuffer {
+ 
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+   std::vector<uintmax_t> command_stream_;
++  std::vector<uintmax_t> move_tail_scratch_;
++
++  // Scissor tracking for LimitRenderPassArea.
++  bool scissor_known_ = false;
++  VkRect2D last_scissor_ = {};
++  bool pass_area_tracking_ = false;
++  bool pass_area_unlimited_ = false;
++  int64_t pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;
++  void ExpandPassArea(const VkRect2D& r) {
++    const int64_t x0 = r.offset.x, y0 = r.offset.y;
++    const int64_t x1 = x0 + int64_t(r.extent.width), y1 = y0 + int64_t(r.extent.height);
++    if (pass_x1_ <= pass_x0_ || pass_y1_ <= pass_y0_) {
++      pass_x0_ = x0;
++      pass_y0_ = y0;
++      pass_x1_ = x1;
++      pass_y1_ = y1;
++    } else {
++      pass_x0_ = std::min(pass_x0_, x0);
++      pass_y0_ = std::min(pass_y0_, y0);
++      pass_x1_ = std::max(pass_x1_, x1);
++      pass_y1_ = std::max(pass_y1_, y1);
++    }
++  }
++  void NoteScissor(const VkRect2D& r) {
++    last_scissor_ = r;
++    scissor_known_ = true;
++    if (pass_area_tracking_) {
++      ExpandPassArea(r);
++    }
++  }
++  void BeginPassAreaTracking() {
++    pass_area_tracking_ = true;
++    pass_area_unlimited_ = !scissor_known_;
++    pass_x0_ = pass_y0_ = pass_x1_ = pass_y1_ = 0;
++    if (scissor_known_) {
++      ExpandPassArea(last_scissor_);
++    }
++  }
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 13c5c1a..aa7ec5a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -85,6 +85,16 @@ REXCVAR_DEFINE_BOOL(gpu_force_msaa_off, false, "GPU/Vulkan",
+                     "multisampled attachment doubles the memory traffic of each render pass. "
+                     "Pair with swap_post_effect=fxaa to smooth edges again.");
+ 
++REXCVAR_DEFINE_BOOL(gpu_pass_timing, false, "GPU/Vulkan",
++                    "Needs gpu_timestamp_queries. Writes a GPU timestamp at every render pass begin "
++                    "and end and logs, every 240 frames, where the GPU time goes (per call site that "
++                    "ended a pass, plus the work between passes).");
++REXCVAR_DEFINE_INT32(gpu_render_area_test_div, 0, "GPU/Vulkan",
++                     "DIAGNOSTIC ONLY (breaks the picture): divide every render pass's render area by "
++                     "this to measure what attachment load/store costs on a tiler. 0 = off.");
++REXCVAR_DEFINE_BOOL(gpu_limit_render_area, false, "GPU/Vulkan",
++                    "Shrink each render pass's render area to the union of the scissors used in it, "
++                    "so a tiled GPU only loads and stores that part of the attachments.");
+ REXCVAR_DEFINE_BOOL(gpu_pass_reason_stats, false, "GPU/Vulkan",
+                     "DIAGNOSTIC - log, every few thousand render pass ends, which call sites "
+                     "ended the pass and how often");
+@@ -3117,6 +3127,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+ 
+           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+           deferred_command_buffer_.CmdVkEndRenderPass();
++          PassTimestamp(PassTimingSiteId("swap_gamma_pass", 0));
+ 
+           // Insert the release barrier.
+           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+@@ -3278,8 +3289,11 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+                          pending_barriers_image_memory_barriers_.size());
+     if (!pending_barriers_buffer_memory_barriers_.empty()) {
+       const VkBufferMemoryBarrier& b = pending_barriers_buffer_memory_barriers_.front();
+-      reason += fmt::format(" buf[{:x}->{:x} size {}K]", uint32_t(b.srcAccessMask), uint32_t(b.dstAccessMask),
+-                            uint64_t(b.size == VK_WHOLE_SIZE ? 0 : b.size >> 10));
++      reason += fmt::format(" buf[{:x}->{:x} size {}K off {}K {}{}]", uint32_t(b.srcAccessMask),
++                            uint32_t(b.dstAccessMask),
++                            uint64_t(b.size == VK_WHOLE_SIZE ? 0 : b.size >> 10), uint64_t(b.offset >> 10),
++                            b.buffer == shared_memory_->buffer() ? "SHM" : "other",
++                            b.size == VK_WHOLE_SIZE ? " whole" : "");
+     }
+     if (!pending_barriers_image_memory_barriers_.empty()) {
+       const VkImageMemoryBarrier& b = pending_barriers_image_memory_barriers_.front();
+@@ -3318,6 +3332,35 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+   return true;
+ }
+ 
++namespace {
++VkExtent2D PassRenderAreaExtent(VkExtent2D full) {
++  int32_t div = REXCVAR_GET(gpu_render_area_test_div);
++  // Live override for experiments: the first integer in <files>/live_div.txt, re-read every ~120
++  // passes (diagnostic only).
++  static uint32_t live_countdown = 0;
++  static int32_t live_div = 0;
++  if (live_countdown-- == 0) {
++    live_countdown = 120;
++    live_div = 0;
++    if (FILE* f = std::fopen("/sdcard/Android/data/org.project8recomp.android/files/live_div.txt", "r")) {
++      int v = 0;
++      if (std::fscanf(f, "%d", &v) == 1) {
++        live_div = v;
++      }
++      std::fclose(f);
++    }
++  }
++  if (live_div > 0) {
++    div = live_div;
++  }
++  if (div > 1) {
++    full.width = std::max<uint32_t>(1, full.width / uint32_t(div));
++    full.height = std::max<uint32_t>(1, full.height / uint32_t(div));
++  }
++  return full;
++}
++}  // namespace
++
+ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+   SubmitBarriers(false);
+@@ -3338,12 +3381,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (in_render_pass_) {
+     NoteRenderPassEnd("render_target_change", 0);
++    FinalizePassRenderArea();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+       deferred_command_buffer_.CmdVkEndRenderPass();
+     }
+     in_render_pass_ = false;
++    PassTimestamp(PassTimingSiteId("render_target_change", 1));
+   }
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+@@ -3370,7 +3415,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     rendering_info.flags = 0;
+     rendering_info.renderArea.offset.x = 0;
+     rendering_info.renderArea.offset.y = 0;
+-    rendering_info.renderArea.extent = framebuffer->host_extent;
++    rendering_info.renderArea.extent = PassRenderAreaExtent(framebuffer->host_extent);
+     rendering_info.layerCount = 1;
+     rendering_info.viewMask = 0;
+     rendering_info.colorAttachmentCount = color_attachment_count;
+@@ -3388,7 +3433,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     render_pass_begin_info.renderArea.offset.y = 0;
+     // TODO(Triang3l): Actual dirty width / height in the deferred command
+     // buffer.
+-    render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
++    render_pass_begin_info.renderArea.extent = PassRenderAreaExtent(framebuffer->host_extent);
+     render_pass_begin_info.clearValueCount = 0;
+     render_pass_begin_info.pClearValues = nullptr;
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+@@ -3396,6 +3441,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+   rex::perf::IncrementCounter(rex::perf::CounterId::kRenderPassBegins);
+   in_render_pass_ = true;
++  PassTimestamp(0xFFFFFFFDu);
+ }
+ 
+ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3419,12 +3465,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   if (in_render_pass_) {
+     NoteRenderPassEnd("render_target_change", 0);
++    FinalizePassRenderArea();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+       deferred_command_buffer_.CmdVkEndRenderPass();
+     }
+     in_render_pass_ = false;
++    PassTimestamp(PassTimingSiteId("render_target_change", 2));
+   }
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+@@ -3471,7 +3519,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     rendering_info.flags = 0;
+     rendering_info.renderArea.offset.x = 0;
+     rendering_info.renderArea.offset.y = 0;
+-    rendering_info.renderArea.extent = framebuffer->host_extent;
++    rendering_info.renderArea.extent = PassRenderAreaExtent(framebuffer->host_extent);
+     rendering_info.layerCount = 1;
+     rendering_info.viewMask = 0;
+     rendering_info.colorAttachmentCount = transfer_dest_is_depth ? 0 : 1;
+@@ -3487,7 +3535,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     render_pass_begin_info.framebuffer = framebuffer->framebuffer;
+     render_pass_begin_info.renderArea.offset.x = 0;
+     render_pass_begin_info.renderArea.offset.y = 0;
+-    render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
++    render_pass_begin_info.renderArea.extent = PassRenderAreaExtent(framebuffer->host_extent);
+     render_pass_begin_info.clearValueCount = 0;
+     render_pass_begin_info.pClearValues = nullptr;
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+@@ -3495,6 +3543,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+   rex::perf::IncrementCounter(rex::perf::CounterId::kRenderPassBegins);
+   in_render_pass_ = true;
++  PassTimestamp(0xFFFFFFFDu);
+ }
+ 
+ namespace {
+@@ -3528,17 +3577,179 @@ void NoteRenderPassEnd(const char* file, uint32_t line) {
+ 
+ }  // namespace
+ 
++
++// ---- gpu_pass_timing -------------------------------------------------------------------------
++
++void VulkanCommandProcessor::PassTimestamp(uint32_t tag) {
++  if (pass_ts_pool_ == VK_NULL_HANDLE || !submission_open_) {
++    return;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  if (pass_ts_slot_frame_[slot] != frame_current_ ||
++      pass_ts_count_[slot] >= kPassTimestampsPerFrame) {
++    return;
++  }
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_ts_pool_,
++      slot * kPassTimestampsPerFrame + pass_ts_count_[slot]);
++  pass_ts_tags_[slot].push_back(tag);
++  ++pass_ts_count_[slot];
++}
++
++namespace {
++std::vector<std::string>& PassTimingSites() {
++  static std::vector<std::string> sites;  // command processor thread only
++  return sites;
++}
++}  // namespace
++
++uint32_t VulkanCommandProcessor::PassTimingSiteId(const char* file, uint32_t line) {
++  if (pass_ts_pool_ == VK_NULL_HANDLE) {
++    return 0;
++  }
++  const char* slash = std::strrchr(file, '/');
++  std::string name = fmt::format("{}:{}", slash ? slash + 1 : file, line);
++  auto& sites = PassTimingSites();
++  for (uint32_t i = 0; i < sites.size(); ++i) {
++    if (sites[i] == name) {
++      return i;
++    }
++  }
++  sites.push_back(std::move(name));
++  return uint32_t(sites.size() - 1);
++}
++
++void VulkanCommandProcessor::PassTimingHarvest() {
++  struct Agg {
++    double ns = 0.0;
++    uint64_t n = 0;
++  };
++  static std::map<uint32_t, Agg> by_site;
++  static std::map<uint32_t, Agg> by_block;
++  static Agg gaps, tail;
++  static uint64_t frames = 0;
++  static double frame_ns = 0.0;
++  const ui::vulkan::VulkanDevice* const device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  for (uint32_t slot = 0; slot < kMaxFramesInFlight; ++slot) {
++    const uint64_t slot_frame = pass_ts_slot_frame_[slot];
++    const uint32_t n = pass_ts_count_[slot];
++    if (!slot_frame || slot_frame > frame_completed_ || n < 2) {
++      continue;
++    }
++    uint64_t stamps[kPassTimestampsPerFrame] = {};
++    if (dfn.vkGetQueryPoolResults(device->device(), pass_ts_pool_, slot * kPassTimestampsPerFrame, n,
++                                  n * sizeof(uint64_t), stamps, sizeof(uint64_t),
++                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++      continue;
++    }
++    pass_ts_slot_frame_[slot] = 0;
++    const std::vector<uint32_t>& tags = pass_ts_tags_[slot];
++    if (tags.size() != n || tags.back() != 0xFFFFFFFCu) {
++      continue;  // Frame did not close cleanly (or overflowed).
++    }
++    for (uint32_t i = 1; i < n; ++i) {
++      if (stamps[i] < stamps[i - 1]) {
++        continue;
++      }
++      const double ns = double(stamps[i] - stamps[i - 1]) * timestamp_period_ns_;
++      const uint32_t tag = tags[i];
++      if (tag == 0xFFFFFFFDu) {
++        gaps.ns += ns;
++        ++gaps.n;
++      } else if (tag == 0xFFFFFFFCu) {
++        tail.ns += ns;
++        ++tail.n;
++      } else if (tag & 0x80000000u) {
++        Agg& a = by_block[tag & 0x7FFFFFFFu];
++        a.ns += ns;
++        ++a.n;
++      } else {
++        Agg& a = by_site[tag];
++        a.ns += ns;
++        ++a.n;
++      }
++    }
++    if (stamps[n - 1] > stamps[0]) {
++      frame_ns += double(stamps[n - 1] - stamps[0]) * timestamp_period_ns_;
++    }
++    if (++frames >= 240) {
++      const double f = double(frames);
++      double pass_ns = 0.0;
++      uint64_t pass_n = 0;
++      std::vector<std::pair<double, uint32_t>> sorted;
++      for (const auto& [id, a] : by_site) {
++        pass_ns += a.ns;
++        pass_n += a.n;
++        sorted.push_back({a.ns, id});
++      }
++      std::sort(sorted.rbegin(), sorted.rend());
++      std::string report = fmt::format(
++          "gpu pass timing ({} frames): frame {:.2f} ms | in-pass {:.2f} ms ({:.1f} passes) | "
++          "between passes {:.2f} ms | tail {:.2f} ms\n",
++          frames, frame_ns / f / 1e6, pass_ns / f / 1e6, double(pass_n) / f, gaps.ns / f / 1e6,
++          tail.ns / f / 1e6);
++      const auto& sites = PassTimingSites();
++      for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
++        const Agg& a = by_site[sorted[i].second];
++        report += fmt::format("  {:<32} {:5.1f}/frame  {:6.2f} ms/frame  {:.2f} ms each\n",
++                              sorted[i].second < sites.size() ? sites[sorted[i].second] : "?",
++                              double(a.n) / f, a.ns / f / 1e6, a.ns / double(a.n) / 1e6);
++      }
++      report += "  -- work between passes, by what it was waiting before:\n";
++      std::vector<std::pair<double, uint32_t>> blocks;
++      for (const auto& [id, a] : by_block) {
++        blocks.push_back({a.ns, id});
++      }
++      std::sort(blocks.rbegin(), blocks.rend());
++      for (size_t i = 0; i < blocks.size() && i < 10; ++i) {
++        const Agg& a = by_block[blocks[i].second];
++        report += fmt::format("  {:<32} {:5.1f}/frame  {:6.2f} ms/frame  {:.3f} ms each\n",
++                              blocks[i].second < sites.size() ? sites[blocks[i].second] : "?",
++                              double(a.n) / f, a.ns / f / 1e6, a.ns / double(a.n) / 1e6);
++      }
++      REXGPU_INFO("{}", report);
++      by_block.clear();
++      by_site.clear();
++      gaps = {};
++      tail = {};
++      frames = 0;
++      frame_ns = 0.0;
++    }
++  }
++}
++
++void VulkanCommandProcessor::FinalizePassRenderArea() {
++  if (!REXCVAR_GET(gpu_limit_render_area) || render_pass_begin_position_ == SIZE_MAX ||
++      current_framebuffer_ == nullptr) {
++    return;
++  }
++  const float coverage = deferred_command_buffer_.LimitRenderPassArea(
++      render_pass_begin_position_, current_framebuffer_->host_extent);
++  static uint64_t passes = 0, limited = 0;  // command processor thread only
++  static double coverage_sum = 0.0;
++  ++passes;
++  coverage_sum += double(coverage);
++  limited += coverage < 0.99f;
++  if (passes % 1000 == 0) {
++    REXGPU_INFO("render area limit: {} passes, mean coverage {:.2f}, {:.0f}% of passes limited",
++                passes, coverage_sum / double(passes), 100.0 * double(limited) / double(passes));
++  }
++}
++
+ void VulkanCommandProcessor::EndRenderPass(const char* reason_file, uint32_t reason_line) {
+   assert_true(submission_open_);
+   if (!in_render_pass_) {
+     return;
+   }
+   NoteRenderPassEnd(reason_file, reason_line);
++  FinalizePassRenderArea();
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+     deferred_command_buffer_.CmdVkEndRenderPass();
+   }
++  PassTimestamp(PassTimingSiteId(reason_file, reason_line));
+   current_render_pass_ = VK_NULL_HANDLE;
+   current_framebuffer_ = nullptr;
+   in_render_pass_ = false;
+@@ -5069,8 +5280,10 @@ bool VulkanCommandProcessor::IssueCopy() {
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
++  PassTimestamp(0x80000000u | PassTimingSiteId("pre_resolve", 0));
+     bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                   written_address, written_length);
++  PassTimestamp(0x80000000u | PassTimingSiteId("resolve", 0));
+     if (resolved) {
+       RecordDrawCensusCopy(written_address, written_length, false);
+       // Unconditionally, so that the exclusion set is already complete if the
+@@ -5453,6 +5666,16 @@ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
+       } else {
+         timestamp_period_ns_ = double(timestamp_period);
+         timestamp_queries_available_ = true;
++        if (REXCVAR_GET(gpu_pass_timing)) {
++          VkQueryPoolCreateInfo pt_info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++          pt_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++          pt_info.queryCount = kPassTimestampsPerFrame * kMaxFramesInFlight;
++          if (dfn.vkCreateQueryPool(device, &pt_info, nullptr, &pass_ts_pool_) != VK_SUCCESS) {
++            pass_ts_pool_ = VK_NULL_HANDLE;
++          } else {
++            REXGPU_INFO("gpu_pass_timing: enabled");
++          }
++        }
+         REXGPU_INFO("gpu_timestamp_queries: enabled, timestampPeriod {} ns",
+                     timestamp_period_ns_);
+       }
+@@ -5514,6 +5737,10 @@ void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
+   if (occlusion_query_pool_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
+   }
++  if (pass_ts_pool_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyQueryPool(device, pass_ts_pool_, nullptr);
++    pass_ts_pool_ = VK_NULL_HANDLE;
++  }
+   if (timestamp_query_pool_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyQueryPool(device, timestamp_query_pool_, nullptr);
+     timestamp_query_pool_ = VK_NULL_HANDLE;
+@@ -5930,6 +6157,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+       deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                    timestamp_query_pool_, first);
+       timestamp_slot_frame_[slot] = frame_current_;
++      if (pass_ts_pool_ != VK_NULL_HANDLE) {
++        PassTimingHarvest();
++        deferred_command_buffer_.CmdVkResetQueryPool(pass_ts_pool_, slot * kPassTimestampsPerFrame,
++                                                     kPassTimestampsPerFrame);
++        pass_ts_slot_frame_[slot] = frame_current_;
++        pass_ts_tags_[slot].clear();
++        pass_ts_count_[slot] = 0;
++        PassTimestamp(0xFFFFFFFEu);
++      }
+     }
+ 
+     // Reset bindings that depend on transient data.
+@@ -6061,6 +6297,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+   // Before the submit block below, which is the last point at which anything
+   // can still be recorded into this frame's command buffer.
++  if (is_closing_frame && pass_ts_pool_ != VK_NULL_HANDLE && submission_open_) {
++    EndRenderPass();
++    PassTimestamp(0xFFFFFFFCu);
++  }
+   if (is_closing_frame && timestamp_queries_available_ && submission_open_) {
+     const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
+     deferred_command_buffer_.CmdVkWriteTimestamp(
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index ad60ade..0c7609a 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -30,6 +30,45 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ 
+ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
++  scissor_known_ = false;
++  pass_area_tracking_ = false;
++  pass_area_unlimited_ = false;
++}
++
++float DeferredCommandBuffer::LimitRenderPassArea(size_t begin_position, VkExtent2D full_extent) {
++  if (!pass_area_tracking_) {
++    return 1.0f;
++  }
++  pass_area_tracking_ = false;
++  if (pass_area_unlimited_ || begin_position == SIZE_MAX ||
++      begin_position + kCommandHeaderSizeElements > command_stream_.size()) {
++    return 1.0f;
++  }
++  constexpr int64_t kAlign = 32;
++  int64_t x0 = std::max<int64_t>(0, pass_x0_) / kAlign * kAlign;
++  int64_t y0 = std::max<int64_t>(0, pass_y0_) / kAlign * kAlign;
++  int64_t x1 = std::min<int64_t>(full_extent.width, (pass_x1_ + kAlign - 1) / kAlign * kAlign);
++  int64_t y1 = std::min<int64_t>(full_extent.height, (pass_y1_ + kAlign - 1) / kAlign * kAlign);
++  if (x1 <= x0 || y1 <= y0) {
++    return 1.0f;
++  }
++  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + begin_position);
++  uint8_t* args_ptr = reinterpret_cast<uint8_t*>(command_stream_.data() + begin_position +
++                                                 kCommandHeaderSizeElements);
++  VkRect2D* area;
++  if (header.command == Command::kVkBeginRendering) {
++    area = &reinterpret_cast<ArgsVkBeginRendering*>(args_ptr)->render_area;
++  } else if (header.command == Command::kVkBeginRenderPass) {
++    area = &reinterpret_cast<ArgsVkBeginRenderPass*>(args_ptr)->render_area;
++  } else {
++    return 1.0f;
++  }
++  area->offset.x = int32_t(x0);
++  area->offset.y = int32_t(y0);
++  area->extent.width = uint32_t(x1 - x0);
++  area->extent.height = uint32_t(y1 - y0);
++  return float(double(x1 - x0) * double(y1 - y0) /
++               (double(full_extent.width) * double(full_extent.height)));
+ }
+ 
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+@@ -379,6 +418,7 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
+ 
+ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
+   assert_null(rendering_info->pNext);
++  BeginPassAreaTracking();
+ 
+   size_t arguments_size =
+       rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));

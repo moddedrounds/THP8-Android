@@ -1,0 +1,31 @@
+#version 450
+// 3x3 component-wise median of the block vectors (removes isolated bad matches).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D mv_in;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform PC { ivec4 a; vec4 b; } pc;  // a.xy blocks
+float med9(float v[9]) {
+  for (int i = 0; i < 5; ++i) {
+    for (int j = i + 1; j < 9; ++j) {
+      if (v[j] < v[i]) { float t = v[i]; v[i] = v[j]; v[j] = t; }
+    }
+  }
+  return v[4];
+}
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, pc.a.xy))) return;
+  float xs[9], ys[9];
+  float err = 0.0;
+  int k = 0;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      vec4 v = texelFetch(mv_in, clamp(p + ivec2(dx, dy), ivec2(0), pc.a.xy - 1), 0);
+      xs[k] = v.x;
+      ys[k] = v.y;
+      if (dx == 0 && dy == 0) err = v.z;
+      ++k;
+    }
+  }
+  imageStore(mv_out, p, vec4(med9(xs), med9(ys), err, 0.0));
+}

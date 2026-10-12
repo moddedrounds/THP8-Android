@@ -1,0 +1,99 @@
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..9da317f 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,9 +9,12 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
++#include <thread>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/cvar.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
+@@ -27,8 +30,45 @@
+ #include <rex/system/xsymboliclink.h>
+ #include <rex/system/xthread.h>
+ 
++REXCVAR_DEFINE_UINT32(kernel_wait_poll_backoff_us, 0, "Kernel",
++                      "A guest thread that keeps calling kernel waits which time out in a tight "
++                      "loop (polling) sleeps this many microseconds per call instead of only "
++                      "yielding its timeslice, once it has timed out several times in a row. "
++                      "sched_yield does not stop such a loop from holding a core at 100%: on a "
++                      "handheld that is heat and a core taken from the threads doing real work. "
++                      "0 = the original behaviour (yield only).");
++
+ namespace rex::system {
+ 
++namespace {
++
++// Called where a wait has just timed out. The original behaviour is a plain yield. With the cvar
++// set, a thread whose waits keep timing out back to back (gaps under 2 ms, so it is not a thread
++// doing real timed waits) sleeps briefly: the guest still gets its TIMEOUT result, just not as
++// fast as the CPU can produce it.
++void OnWaitTimedOut() {
++  const uint32_t backoff_us = REXCVAR_GET(kernel_wait_poll_backoff_us);
++  if (!backoff_us) {
++    rex::thread::MaybeYield();
++    return;
++  }
++  thread_local uint32_t consecutive = 0;
++  thread_local std::chrono::steady_clock::time_point last{};
++  const auto now = std::chrono::steady_clock::now();
++  if (now - last > std::chrono::milliseconds(2)) {
++    consecutive = 0;
++  }
++  if (++consecutive >= 8) {
++    std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
++    last = std::chrono::steady_clock::now();
++  } else {
++    rex::thread::MaybeYield();
++    last = now;
++  }
++}
++
++}  // namespace
++
+ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
+   handles_.reserve(10);
+ }
+@@ -223,7 +263,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+       // Or X_STATUS_ALERTED?
+       return X_STATUS_USER_APC;
+     case rex::thread::WaitResult::kTimeout:
+-      rex::thread::MaybeYield();
++      OnWaitTimedOut();
+       return X_STATUS_TIMEOUT;
+     default:
+     case rex::thread::WaitResult::kAbandoned:
+@@ -250,7 +290,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+       // Or X_STATUS_ALERTED?
+       return X_STATUS_USER_APC;
+     case rex::thread::WaitResult::kTimeout:
+-      rex::thread::MaybeYield();
++      OnWaitTimedOut();
+       return X_STATUS_TIMEOUT;
+     default:
+     case rex::thread::WaitResult::kAbandoned:
+@@ -286,7 +326,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         // Or X_STATUS_ALERTED?
+         return X_STATUS_USER_APC;
+       case rex::thread::WaitResult::kTimeout:
+-        rex::thread::MaybeYield();
++        OnWaitTimedOut();
+         return X_STATUS_TIMEOUT;
+       default:
+       case rex::thread::WaitResult::kAbandoned:
+@@ -309,7 +349,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         // Or X_STATUS_ALERTED?
+         return X_STATUS_USER_APC;
+       case rex::thread::WaitResult::kTimeout:
+-        rex::thread::MaybeYield();
++        OnWaitTimedOut();
+         return X_STATUS_TIMEOUT;
+       default:
+       case rex::thread::WaitResult::kAbandoned:

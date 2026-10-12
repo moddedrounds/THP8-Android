@@ -1,0 +1,81 @@
+#version 450
+// Motion-compensated frame at time t between prev (t=0) and cur (t=1).
+//
+// b.w = 1 (gpu_frame_generation_pixel_vectors):
+// - Static pixels: a pixel unchanged over the last two real frame pairs (the still count kept by
+//   fg_copy.comp, plus prev == cur now) is the HUD, a menu or anything else that does not move: it
+//   is copied, never warped with the world behind it.
+// - Per-pixel vector choice: the block vectors are 16x16 pixels, so a block holding a fence and
+//   the scenery behind it, or the HUD and the world, has one vector that is wrong for part of it.
+//   Each pixel tries its own (bilinear) block vector, the four neighbouring block vectors and zero
+//   motion and keeps the one whose two warped samples agree best (3-pixel horizontal error), with
+//   a bias towards its own vector.
+// Measured offline on a real 60 fps recording (fg_eval.py: generate frame i+1 from i and i+2):
+// mean error 13.53 -> 13.45, static pixels 1.95 -> 1.69 (0-255 scale).
+// Where even the chosen vector's samples disagree (occlusion, water, a bad match) it falls back to
+// a cross-fade of the unwarped frames. b.w = 0: one vector per block (the first version).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D prev;
+layout(set = 0, binding = 1) uniform sampler2D cur;
+layout(set = 0, binding = 2) uniform sampler2D mv;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D still;
+layout(push_constant) uniform PC { ivec4 a; vec4 b; } pc;  // a.xy size, b.xy 1/size, b.z t, b.w per-pixel choice
+
+const vec3 kLuma = vec3(0.299, 0.587, 0.114);
+
+float Err(vec2 q, vec2 v, float t) {
+  vec2 qa = q - t * v;
+  vec2 qc = q + (1.0 - t) * v;
+  float e = 0.0;
+  for (int i = -1; i <= 1; ++i) {
+    vec2 o = vec2(float(i), 0.0);
+    vec3 a = texture(prev, (qa + o) * pc.b.xy).rgb;
+    vec3 c = texture(cur, (qc + o) * pc.b.xy).rgb;
+    e += (i == 0 ? 2.0 : 1.0) * dot(abs(a - c), kLuma);
+  }
+  return e * 0.25;
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(p, pc.a.xy))) return;
+  vec2 q = vec2(p) + 0.5;
+  vec2 uv = q * pc.b.xy;
+  float t = pc.b.z;
+  vec4 p0 = texture(prev, uv);
+  vec4 c0 = texture(cur, uv);
+  if (pc.b.w > 0.5) {
+    vec3 sd = abs(p0.rgb - c0.rgb);
+    if (max(sd.r, max(sd.g, sd.b)) < 1.5 / 255.0 && imageLoad(still, p).r > 0.5) {
+      imageStore(dst, p, vec4(c0.rgb, 1.0));
+      return;
+    }
+  }
+  vec2 v = texture(mv, uv).xy;
+  if (pc.b.w > 0.5) {
+    const float kBias = 0.05;
+    float best = Err(q, v, t);
+    if (best > kBias) {
+      vec2 own = v;
+      float e = Err(q, vec2(0.0), t) + kBias;
+      if (e < best) { best = e; v = vec2(0.0); }
+      ivec2 blk = p / 16;
+      ivec2 bmax = textureSize(mv, 0) - 1;
+      const ivec2 offs[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+      for (int k = 0; k < 4; ++k) {
+        vec2 n = texelFetch(mv, clamp(blk + offs[k], ivec2(0), bmax), 0).xy;
+        if (all(lessThan(abs(n - own), vec2(0.5)))) continue;
+        e = Err(q, n, t) + kBias;
+        if (e < best) { best = e; v = n; }
+      }
+    }
+  }
+  vec4 a = texture(prev, (q - t * v) * pc.b.xy);
+  vec4 c = texture(cur, (q + (1.0 - t) * v) * pc.b.xy);
+  vec4 warped = mix(a, c, t);
+  vec4 fade = mix(p0, c0, t);
+  float d = length(a.rgb - c.rgb);
+  float w = smoothstep(0.08, 0.25, d);
+  imageStore(dst, p, vec4(mix(warped, fade, w).rgb, 1.0));
+}

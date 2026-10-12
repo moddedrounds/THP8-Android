@@ -1,0 +1,1938 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index aff0fa5..fe97e0c 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -52,6 +52,8 @@ namespace draw_census {
+ class Recorder;
+ }
+ 
++class FrameGenerator;
++
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
+   // Single-descriptor layouts for use within a single frame.
+@@ -714,6 +716,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
+ 
+   std::unique_ptr<VulkanTextureCache> texture_cache_;
++  std::unique_ptr<FrameGenerator> frame_generator_;
++  friend class FrameGenerator;
+ 
+   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
+   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index eae1f64..1b40c7c 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -14,6 +14,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
++XE_UI_VULKAN_FUNCTION(vkCmdCopyImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyImageToBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkCmdDispatch)
+@@ -80,6 +81,7 @@ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
++XE_UI_VULKAN_FUNCTION(vkResetCommandBuffer)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
+ XE_UI_VULKAN_FUNCTION(vkResetDescriptorPool)
+ XE_UI_VULKAN_FUNCTION(vkResetFences)
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 89e9aea..44f24dc 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -47,6 +47,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
+     vulkan/deferred_command_buffer.cpp
+     vulkan/command_processor.cpp
+     vulkan/draw_census.cc
++    vulkan/frame_generation.cpp
+     vulkan/native_residency.cc
+     vulkan/pipeline_cache.cpp
+     vulkan/primitive_processor.cpp
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index bb5dbc0..9bab8c6 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -40,6 +40,7 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/vulkan/command_processor.h>
++#include "frame_generation.h"
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/vulkan/shader.h>
+@@ -65,6 +66,22 @@ REXCVAR_DEFINE_BOOL(vulkan_completion_queries, true, "GPU/Vulkan",
+                     "kgsl backend becomes an unbounded kernel wait (the command processor then "
+                     "blocks on the GPU at every poll). Live flag 2048 turns it off for A/B.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(gpu_frame_generation, false, "GPU/Vulkan",
++                    "Frame generation: at every swap also present a motion-compensated frame halfway "
++                    "between the previous and the current guest frame, so a 30 fps game is shown at "
++                    "60. Use with FIFO presentation (disallow mailbox/immediate present modes).")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(gpu_frame_generation_factor, 0, "GPU/Vulkan",
++                     "Frames shown per guest frame with gpu_frame_generation: 2 (30 -> 60 on a 60 Hz "
++                     "display), 4 (30 -> 120 on a 120 Hz display), or 0 = from the display's current "
++                     "refresh rate (files/display_hz.txt, written by the Android activity)")
++    .range(0, 4)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_frame_generation_max_factor, 2, "GPU/Vulkan",
++                     "Upper bound of the automatic factor (4 allows 30 -> 120 when the display runs "
++                     "at 120 Hz; needs 120 Hz enabled in the system display settings)")
++    .range(2, 4)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_INT32(gpu_shadow_skip_level, 0, "GPU/Vulkan",
+                      "Shadow-map update skipping (quality trade): 0 off; 1 = the 1024 and 512 "
+                      "shadow targets update on alternate frames; 2 = each updates every 4th frame "
+@@ -2163,10 +2180,19 @@ bool VulkanCommandProcessor::SetupContext() {
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+ 
++  if (REXCVAR_GET(gpu_frame_generation)) {
++    frame_generator_ = std::make_unique<FrameGenerator>(*this);
++    if (!frame_generator_->Initialize()) {
++      REXGPU_WARN("Frame generation unavailable");
++      frame_generator_.reset();
++    }
++  }
++
+   return true;
+ }
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
++  frame_generator_.reset();
+   AwaitAllQueueOperationsCompletion();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+@@ -2786,9 +2812,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+ 
+   std::optional<PacingTimer> refresh_timer;
+   refresh_timer.emplace('R');
+-  presenter->RefreshGuestOutput(
+-      guest_output_width, guest_output_height, display_width, display_height,
+-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
++  VkImageView refresh_source_view = swap_texture_view;
++  auto swap_refresher =
++      [this, guest_output_width, guest_output_height, frontbuffer_format, &refresh_source_view,
+        swap_post_effect,
+        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         // In case the swap command is the only one in the frame.
+@@ -2965,7 +2991,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+         VkDescriptorSet swap_descriptor_source = swap_descriptors_source_[swap_frame_index];
+         VkDescriptorImageInfo swap_descriptor_source_image_info;
+         swap_descriptor_source_image_info.sampler = VK_NULL_HANDLE;
+-        swap_descriptor_source_image_info.imageView = swap_texture_view;
++        swap_descriptor_source_image_info.imageView = refresh_source_view;
+         swap_descriptor_source_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+         VkWriteDescriptorSet swap_descriptor_source_write;
+         swap_descriptor_source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+@@ -3301,7 +3327,82 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+         // queue, and also need to submit the release barrier.
+         EndSubmission(true);
+         return true;
+-      });
++      };
++  // Frame generation: render the frame halfway between the previous guest frame and this one and
++  // the real frame into a slot of the generator's images; its pacer thread presents them on
++  // consecutive vblanks, so presentation never blocks the command processor.
++  bool frame_generated = false;
++  if (frame_generator_) {
++    const int slot = frame_generator_->AcquireSlot();
++    if (slot >= 0 && frame_generator_->EnsureOutputs(guest_output_width, guest_output_height) &&
++        BeginSubmission(true)) {
++      EndRenderPass();
++      SubmitBarriers(true);
++      FrameGenerator::Entry entry;
++      entry.slot = slot;
++      entry.width = guest_output_width;
++      entry.height = guest_output_height;
++      entry.display_width = display_width;
++      entry.display_height = display_height;
++      int factor = REXCVAR_GET(gpu_frame_generation_factor);
++      if (factor <= 0) {
++        // Auto: one shown frame per display refresh at the guest's 30 fps.
++        static int display_hz = 60;
++        static auto last_read = std::chrono::steady_clock::time_point();
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last_read > std::chrono::seconds(2)) {
++          last_read = now;
++          if (FILE* f = std::fopen(
++                  "/sdcard/Android/data/org.project8recomp.android/files/display_hz.txt", "r")) {
++            int hz = 0;
++            if (std::fscanf(f, "%d", &hz) == 1 && hz >= 30 && hz <= 240) {
++              display_hz = hz;
++            }
++            std::fclose(f);
++          }
++        }
++        factor = std::min((display_hz + 15) / 30, REXCVAR_GET(gpu_frame_generation_max_factor));
++      }
++      factor = std::clamp(factor, 2, 4);
++      float times[FrameGenerator::kMaxGenerated];
++      for (int k = 0; k < factor - 1; ++k) {
++        times[k] = float(k + 1) / float(factor);
++      }
++      const int generated = frame_generator_->Record(swap_texture_view, guest_output_width,
++                                                     guest_output_height, times, factor - 1);
++      for (int k = 0; k < generated; ++k) {
++        FrameGenerator::OutputImage& out = frame_generator_->output(slot, k);
++        bool is_8bpc = true;
++        ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext context(
++            is_8bpc, out.image, out.view, out.version, out.written);
++        refresh_source_view = frame_generator_->interpolated_view(k);
++        if (!swap_refresher(context)) {
++          break;
++        }
++        out.written = true;
++        entry.interp_8bpc[k] = is_8bpc;
++        entry.interp_count = k + 1;
++      }
++      refresh_source_view = swap_texture_view;
++      FrameGenerator::OutputImage& out =
++          frame_generator_->output(slot, FrameGenerator::kMaxGenerated);
++      bool is_8bpc = true;
++      ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext context(
++          is_8bpc, out.image, out.view, out.version, out.written);
++      if (swap_refresher(context)) {
++        out.written = true;
++        entry.real_8bpc = is_8bpc;
++        frame_generator_->Submit(entry, presenter);
++        frame_generated = true;
++      }
++    }
++    if (slot >= 0 && !frame_generated) {
++      frame_generator_->ReleaseSlot(slot);
++    }
++  } else {
++    presenter->RefreshGuestOutput(guest_output_width, guest_output_height, display_width,
++                                  display_height, swap_refresher);
++  }
+ 
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+diff --git a/src/graphics/vulkan/frame_generation.cpp b/src/graphics/vulkan/frame_generation.cpp
+new file mode 100755
+index 0000000..dd512bf
+--- /dev/null
++++ b/src/graphics/vulkan/frame_generation.cpp
+@@ -0,0 +1,641 @@
++/**
++ * @file        frame_generation.cpp
++ * @brief       Motion-compensated frame interpolation of the guest output (see the header).
++ */
++
++#include "frame_generation.h"
++
++#include <algorithm>
++#include <cstring>
++
++#include <rex/graphics/vulkan/command_processor.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/ui/presenter.h>
++#include <rex/ui/vulkan/device.h>
++#include <rex/ui/vulkan/presenter.h>
++#include <rex/ui/vulkan/util.h>
++
++REXCVAR_DEFINE_BOOL(gpu_frame_generation_debug_interp_only, false, "GPU/Vulkan",
++                    "Debug: present only the generated (interpolated) frames, at the guest rate, to "
++                    "inspect their quality")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::graphics::vulkan {
++
++namespace {
++#include "frame_generation_shaders.inc"
++
++struct PushConstants {
++  int32_t a[4];
++  float b[4];
++};
++constexpr VkFormat kFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
++}  // namespace
++
++FrameGenerator::FrameGenerator(VulkanCommandProcessor& command_processor)
++    : command_processor_(command_processor) {}
++
++FrameGenerator::~FrameGenerator() { Shutdown(); }
++
++bool FrameGenerator::Initialize() {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  const VkDevice vk_device = device->device();
++
++  VkDescriptorSetLayoutBinding bindings[4] = {};
++  for (uint32_t i = 0; i < 4; ++i) {
++    bindings[i].binding = i;
++    bindings[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
++                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++    bindings[i].descriptorCount = 1;
++    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++  }
++  VkDescriptorSetLayoutCreateInfo set_layout_info = {
++      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++  set_layout_info.bindingCount = 4;
++  set_layout_info.pBindings = bindings;
++  if (dfn.vkCreateDescriptorSetLayout(vk_device, &set_layout_info, nullptr, &set_layout_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++  VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants)};
++  VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++  layout_info.setLayoutCount = 1;
++  layout_info.pSetLayouts = &set_layout_;
++  layout_info.pushConstantRangeCount = 1;
++  layout_info.pPushConstantRanges = &push_range;
++  if (dfn.vkCreatePipelineLayout(vk_device, &layout_info, nullptr, &pipeline_layout_) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkDescriptorPoolSize pool_sizes[2] = {
++      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kSetsPerSlot * kSlots},
++      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSetsPerSlot * kSlots}};
++  VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++  pool_info.maxSets = kSetsPerSlot * kSlots;
++  pool_info.poolSizeCount = 2;
++  pool_info.pPoolSizes = pool_sizes;
++  if (dfn.vkCreateDescriptorPool(vk_device, &pool_info, nullptr, &pool_) != VK_SUCCESS) {
++    return false;
++  }
++  for (auto& slot_sets : sets_) {
++    std::array<VkDescriptorSetLayout, kSetsPerSlot> layouts;
++    layouts.fill(set_layout_);
++    VkDescriptorSetAllocateInfo alloc_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++    alloc_info.descriptorPool = pool_;
++    alloc_info.descriptorSetCount = kSetsPerSlot;
++    alloc_info.pSetLayouts = layouts.data();
++    if (dfn.vkAllocateDescriptorSets(vk_device, &alloc_info, slot_sets.data()) != VK_SUCCESS) {
++      return false;
++    }
++  }
++
++  VkSamplerCreateInfo sampler_info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++  sampler_info.magFilter = VK_FILTER_LINEAR;
++  sampler_info.minFilter = VK_FILTER_LINEAR;
++  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++  sampler_info.maxLod = 0.0f;
++  if (dfn.vkCreateSampler(vk_device, &sampler_info, nullptr, &sampler_) != VK_SUCCESS) {
++    return false;
++  }
++
++  const struct {
++    const uint32_t* code;
++    size_t size;
++  } shaders[kPassCount] = {{kFg_luma, sizeof(kFg_luma)},
++                           {kFg_match, sizeof(kFg_match)},
++                           {kFg_median, sizeof(kFg_median)},
++                           {kFg_interp, sizeof(kFg_interp)},
++                           {kFg_copy, sizeof(kFg_copy)}};
++  for (uint32_t i = 0; i < kPassCount; ++i) {
++    pipelines_[i] = ui::vulkan::util::CreateComputePipeline(device, pipeline_layout_,
++                                                             shaders[i].code, shaders[i].size);
++    if (pipelines_[i] == VK_NULL_HANDLE) {
++      REXGPU_ERROR("FrameGenerator: failed to create compute pipeline {}", i);
++      return false;
++    }
++  }
++  VkCommandPoolCreateInfo pool_create = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  pool_create.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++  pool_create.queueFamilyIndex = device->queue_family_graphics_compute();
++  if (dfn.vkCreateCommandPool(vk_device, &pool_create, nullptr, &copy_pool_) != VK_SUCCESS) {
++    return false;
++  }
++  VkCommandBufferAllocateInfo cb_alloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  cb_alloc.commandPool = copy_pool_;
++  cb_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++  cb_alloc.commandBufferCount = 4;
++  if (dfn.vkAllocateCommandBuffers(vk_device, &cb_alloc, copy_buffers_) != VK_SUCCESS) {
++    return false;
++  }
++  for (VkFence& fence : copy_fences_) {
++    VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    if (dfn.vkCreateFence(vk_device, &fence_info, nullptr, &fence) != VK_SUCCESS) {
++      return false;
++    }
++  }
++  pacer_ = std::thread([this] { PacerMain(); });
++  REXGPU_INFO("FrameGenerator: initialized");
++  return true;
++}
++
++void FrameGenerator::Shutdown() {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  if (!device) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  const VkDevice vk_device = device->device();
++  if (pacer_.joinable()) {
++    {
++      std::lock_guard<std::mutex> lock(pacer_mutex_);
++      pacer_stop_ = true;
++    }
++    pacer_cv_.notify_all();
++    pacer_.join();
++  }
++  for (uint32_t i = 0; i < 4; ++i) {
++    if (copy_fences_[i] != VK_NULL_HANDLE) {
++      if (copy_fence_pending_[i]) {
++        dfn.vkWaitForFences(vk_device, 1, &copy_fences_[i], VK_TRUE, UINT64_MAX);
++      }
++      dfn.vkDestroyFence(vk_device, copy_fences_[i], nullptr);
++      copy_fences_[i] = VK_NULL_HANDLE;
++    }
++  }
++  if (copy_pool_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyCommandPool(vk_device, copy_pool_, nullptr);
++    copy_pool_ = VK_NULL_HANDLE;
++  }
++  DestroyOutputs();
++  DestroyImages();
++  for (VkPipeline& pipeline : pipelines_) {
++    if (pipeline != VK_NULL_HANDLE) {
++      dfn.vkDestroyPipeline(vk_device, pipeline, nullptr);
++      pipeline = VK_NULL_HANDLE;
++    }
++  }
++  if (sampler_ != VK_NULL_HANDLE) {
++    dfn.vkDestroySampler(vk_device, sampler_, nullptr);
++    sampler_ = VK_NULL_HANDLE;
++  }
++  if (pool_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyDescriptorPool(vk_device, pool_, nullptr);
++    pool_ = VK_NULL_HANDLE;
++  }
++  if (pipeline_layout_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyPipelineLayout(vk_device, pipeline_layout_, nullptr);
++    pipeline_layout_ = VK_NULL_HANDLE;
++  }
++  if (set_layout_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyDescriptorSetLayout(vk_device, set_layout_, nullptr);
++    set_layout_ = VK_NULL_HANDLE;
++  }
++}
++
++bool FrameGenerator::CreateImage(Image& image, uint32_t width, uint32_t height) {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++  info.imageType = VK_IMAGE_TYPE_2D;
++  info.format = kFormat;
++  info.extent = {std::max(width, 1u), std::max(height, 1u), 1};
++  info.mipLevels = 1;
++  info.arrayLayers = 1;
++  info.samples = VK_SAMPLE_COUNT_1_BIT;
++  info.tiling = VK_IMAGE_TILING_OPTIMAL;
++  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++          device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image.image, image.memory)) {
++    return false;
++  }
++  VkImageViewCreateInfo view_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  view_info.image = image.image;
++  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++  view_info.format = kFormat;
++  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  if (device->functions().vkCreateImageView(device->device(), &view_info, nullptr, &image.view) !=
++      VK_SUCCESS) {
++    return false;
++  }
++  image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
++  return true;
++}
++
++void FrameGenerator::DestroyImage(Image& image) {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  if (image.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device->device(), image.view, nullptr);
++  if (image.image != VK_NULL_HANDLE) dfn.vkDestroyImage(device->device(), image.image, nullptr);
++  if (image.memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device->device(), image.memory, nullptr);
++  image = Image();
++}
++
++void FrameGenerator::DestroyImages() {
++  DestroyImage(prev_);
++  for (Image& image : interp_) {
++    DestroyImage(image);
++  }
++  DestroyImage(mv_raw_);
++  DestroyImage(mv_);
++  DestroyImage(luma_[0]);
++  DestroyImage(luma_[1]);
++  width_ = height_ = 0;
++  has_prev_ = false;
++}
++
++bool FrameGenerator::EnsureImages(uint32_t width, uint32_t height) {
++  if (width == width_ && height == height_ && prev_.image != VK_NULL_HANDLE) {
++    return true;
++  }
++  if (prev_.image != VK_NULL_HANDLE) {
++    // Size change (rare): wait for the GPU instead of tracking the old images' last use.
++    command_processor_.AwaitAllQueueOperationsCompletion();
++    DestroyImages();
++  }
++  const uint32_t luma_w = (width + 3) / 4, luma_h = (height + 3) / 4;
++  const uint32_t blocks_w = (luma_w + 3) / 4, blocks_h = (luma_h + 3) / 4;
++  if (!CreateImage(prev_, width, height) || !CreateImage(interp_[0], width, height) ||
++      !CreateImage(interp_[1], width, height) || !CreateImage(interp_[2], width, height) ||
++      !CreateImage(luma_[0], luma_w, luma_h) || !CreateImage(luma_[1], luma_w, luma_h) ||
++      !CreateImage(mv_raw_, blocks_w, blocks_h) || !CreateImage(mv_, blocks_w, blocks_h)) {
++    REXGPU_ERROR("FrameGenerator: failed to create {}x{} images", width, height);
++    DestroyImages();
++    return false;
++  }
++  width_ = width;
++  height_ = height;
++  has_prev_ = false;
++  REXGPU_INFO("FrameGenerator: {}x{} guest output, {}x{} motion blocks", width, height, blocks_w,
++              blocks_h);
++  return true;
++}
++
++void FrameGenerator::Transition(Image& image, VkImageLayout new_layout,
++                                VkPipelineStageFlags src_stage, VkAccessFlags src_access) {
++  VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++  barrier.srcAccessMask = src_access;
++  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  barrier.oldLayout = image.layout;
++  barrier.newLayout = new_layout;
++  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.image = image.image;
++  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  command_processor_.deferred_command_buffer().CmdVkPipelineBarrier(
++      src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
++      0, nullptr, 0, nullptr, 1, &barrier);
++  image.layout = new_layout;
++}
++
++void FrameGenerator::Dispatch(Pass pass, VkDescriptorSet set, const int32_t a[4], const float b[4],
++                              uint32_t groups_x, uint32_t groups_y) {
++  DeferredCommandBuffer& cb = command_processor_.deferred_command_buffer();
++  command_processor_.BindExternalComputePipeline(pipelines_[pass]);
++  cb.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &set, 0,
++                             nullptr);
++  PushConstants pc;
++  std::memcpy(pc.a, a, sizeof(pc.a));
++  std::memcpy(pc.b, b, sizeof(pc.b));
++  cb.CmdVkPushConstants(pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
++  cb.CmdVkDispatch(groups_x, groups_y, 1);
++}
++
++int FrameGenerator::Record(VkImageView current, uint32_t width, uint32_t height, const float* t,
++                           int count) {
++  count = std::min(std::max(count, 1), kMaxGenerated);
++  if (pipelines_[0] == VK_NULL_HANDLE || current == VK_NULL_HANDLE || !EnsureImages(width, height)) {
++    return 0;
++  }
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  DeferredCommandBuffer& cb = command_processor_.deferred_command_buffer();
++
++  const uint32_t luma_w = (width + 3) / 4, luma_h = (height + 3) / 4;
++  const uint32_t blocks_w = (luma_w + 3) / 4, blocks_h = (luma_h + 3) / 4;
++  const uint32_t luma_cur = luma_current_, luma_prev = luma_current_ ^ 1;
++  const std::array<VkDescriptorSet, kSetsPerSlot>& sets = sets_[slot_];
++  slot_ = (slot_ + 1) % kSlots;
++
++  // Descriptors (this slot's sets were last used kSlots swaps ago).
++  auto image_info = [&](VkImageView view, VkImageLayout layout) {
++    VkDescriptorImageInfo info;
++    info.sampler = sampler_;
++    info.imageView = view;
++    info.imageLayout = layout;
++    return info;
++  };
++  const VkImageLayout gen = VK_IMAGE_LAYOUT_GENERAL;
++  const VkImageLayout ro = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++  VkDescriptorImageInfo infos[kSetsPerSlot][4] = {
++      {image_info(current, ro), {}, {}, image_info(luma_[luma_cur].view, gen)},
++      {image_info(luma_[luma_prev].view, gen), image_info(luma_[luma_cur].view, gen),
++       image_info(mv_.view, gen), image_info(mv_raw_.view, gen)},
++      {image_info(mv_raw_.view, gen), {}, {}, image_info(mv_.view, gen)},
++      {image_info(prev_.view, gen), image_info(current, ro), image_info(mv_.view, gen),
++       image_info(interp_[0].view, gen)},
++      {image_info(current, ro), {}, {}, image_info(prev_.view, gen)},
++      {image_info(prev_.view, gen), image_info(current, ro), image_info(mv_.view, gen),
++       image_info(interp_[1].view, gen)},
++      {image_info(prev_.view, gen), image_info(current, ro), image_info(mv_.view, gen),
++       image_info(interp_[2].view, gen)}};
++  const uint8_t used[kSetsPerSlot] = {0b1001, 0b1111, 0b1001, 0b1111, 0b1001, 0b1111, 0b1111};
++  VkWriteDescriptorSet writes[kSetsPerSlot * 4];
++  uint32_t write_count = 0;
++  for (uint32_t p = 0; p < kSetsPerSlot; ++p) {
++    for (uint32_t b = 0; b < 4; ++b) {
++      if (!(used[p] & (1u << b))) continue;
++      VkWriteDescriptorSet& w = writes[write_count++];
++      w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++      w.dstSet = sets[p];
++      w.dstBinding = b;
++      w.descriptorCount = 1;
++      w.descriptorType =
++          b < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++      w.pImageInfo = &infos[p][b];
++    }
++  }
++  dfn.vkUpdateDescriptorSets(device->device(), write_count, writes, 0, nullptr);
++
++  // Everything written earlier (the guest frame, last swap's passes and its reads of interp_).
++  VkMemoryBarrier memory_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++  memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
++  memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  cb.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                          0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
++  for (Image* image : {&prev_, &interp_[0], &interp_[1], &interp_[2], &mv_raw_, &mv_, &luma_[0],
++                       &luma_[1]}) {
++    if (image->layout != gen) {
++      Transition(*image, gen, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_READ_BIT);
++    }
++  }
++  memory_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++  memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  auto compute_barrier = [&]() {
++    cb.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory_barrier, 0, nullptr,
++                            0, nullptr);
++  };
++
++  const float inv_w = 1.0f / float(width), inv_h = 1.0f / float(height);
++  {
++    const int32_t a[4] = {int32_t(luma_w), int32_t(luma_h), 0, 0};
++    const float b[4] = {inv_w, inv_h, 0.0f, 0.0f};
++    Dispatch(kLuma, sets[kLuma], a, b, (luma_w + 7) / 8, (luma_h + 7) / 8);
++  }
++  compute_barrier();
++  const bool interpolated = has_prev_;
++  if (interpolated) {
++    {
++      const int32_t a[4] = {int32_t(blocks_w), int32_t(blocks_h), int32_t(luma_w), int32_t(luma_h)};
++      // Search +-6 around the previous vector; the predictor is valid once a vector field exists.
++      const float b[4] = {0.004f, 6.0f, has_mv_ ? 1.0f : 0.0f, 0.0f};
++      Dispatch(kMatch, sets[kMatch], a, b, (blocks_w + 7) / 8, (blocks_h + 7) / 8);
++    }
++    compute_barrier();
++    {
++      const int32_t a[4] = {int32_t(blocks_w), int32_t(blocks_h), 0, 0};
++      const float b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++      Dispatch(kMedian, sets[kMedian], a, b, (blocks_w + 7) / 8, (blocks_h + 7) / 8);
++    }
++    compute_barrier();
++    for (int k = 0; k < count; ++k) {
++      const int32_t a[4] = {int32_t(width), int32_t(height), 0, 0};
++      const float b[4] = {inv_w, inv_h, t[k], 0.0f};
++      Dispatch(kInterp, sets[k == 0 ? kInterp : kPassCount + k - 1], a, b, (width + 7) / 8,
++               (height + 7) / 8);
++    }
++    compute_barrier();
++  }
++  {
++    const int32_t a[4] = {int32_t(width), int32_t(height), 0, 0};
++    const float b[4] = {inv_w, inv_h, 0.0f, 0.0f};
++    Dispatch(kCopy, sets[kCopy], a, b, (width + 7) / 8, (height + 7) / 8);
++  }
++  compute_barrier();
++  if (interpolated) {
++    // The swap samples it next, from a fragment or compute shader.
++    for (int k = 0; k < count; ++k) {
++      Transition(interp_[k], ro, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
++    }
++  }
++  luma_current_ ^= 1;
++  has_mv_ = interpolated;
++  has_prev_ = true;
++  return interpolated ? count : 0;
++}
++
++int FrameGenerator::AcquireSlot() {
++  std::unique_lock<std::mutex> lock(pacer_mutex_);
++  const int slot = next_slot_;
++  // The pacer shows a slot within about two display refreshes; waiting at all means the display
++  // runs slower than twice the guest rate. Bounded so a stuck presenter cannot stall the guest.
++  if (!pacer_cv_.wait_for(lock, std::chrono::milliseconds(50), [&] { return !slot_busy_[slot]; })) {
++    return -1;
++  }
++  slot_busy_[slot] = true;
++  next_slot_ ^= 1;
++  return slot;
++}
++
++void FrameGenerator::ReleaseSlot(int slot) {
++  {
++    std::lock_guard<std::mutex> lock(pacer_mutex_);
++    slot_busy_[slot] = false;
++  }
++  pacer_cv_.notify_all();
++}
++
++bool FrameGenerator::EnsureOutputs(uint32_t width, uint32_t height) {
++  if (width == output_width_ && height == output_height_ && outputs_[0].image != VK_NULL_HANDLE) {
++    return true;
++  }
++  if (outputs_[0].image != VK_NULL_HANDLE) {
++    command_processor_.AwaitAllQueueOperationsCompletion();
++    {
++      // The pacer may still hold copies of the old images queued.
++      std::unique_lock<std::mutex> lock(pacer_mutex_);
++      pacer_cv_.wait_for(lock, std::chrono::milliseconds(200), [&] { return pacer_queue_.empty(); });
++    }
++    DestroyOutputs();
++  }
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  for (OutputImage& out : outputs_) {
++    VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++    info.imageType = VK_IMAGE_TYPE_2D;
++    info.format = ui::vulkan::VulkanPresenter::kGuestOutputFormat;
++    info.extent = {std::max(width, 1u), std::max(height, 1u), 1};
++    info.mipLevels = 1;
++    info.arrayLayers = 1;
++    info.samples = VK_SAMPLE_COUNT_1_BIT;
++    info.tiling = VK_IMAGE_TILING_OPTIMAL;
++    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++            device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, out.image, out.memory)) {
++      DestroyOutputs();
++      return false;
++    }
++    VkImageViewCreateInfo view_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++    view_info.image = out.image;
++    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    view_info.format = info.format;
++    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    if (device->functions().vkCreateImageView(device->device(), &view_info, nullptr, &out.view) !=
++        VK_SUCCESS) {
++      DestroyOutputs();
++      return false;
++    }
++    out.version = next_version_++;
++    out.written = false;
++  }
++  output_width_ = width;
++  output_height_ = height;
++  return true;
++}
++
++void FrameGenerator::DestroyOutputs() {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  for (OutputImage& out : outputs_) {
++    if (out.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device->device(), out.view, nullptr);
++    if (out.image != VK_NULL_HANDLE) dfn.vkDestroyImage(device->device(), out.image, nullptr);
++    if (out.memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device->device(), out.memory, nullptr);
++    out = OutputImage();
++  }
++  output_width_ = output_height_ = 0;
++}
++
++void FrameGenerator::Submit(const Entry& entry, ui::Presenter* presenter) {
++  {
++    std::lock_guard<std::mutex> lock(pacer_mutex_);
++    presenter_ = presenter;
++    pacer_queue_.push_back(entry);
++  }
++  pacer_cv_.notify_all();
++}
++
++bool FrameGenerator::CopyToPresenter(const OutputImage& source, VkImage destination,
++                                     uint32_t width, uint32_t height) {
++  const ui::vulkan::VulkanDevice* device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
++  const VkDevice vk_device = device->device();
++  const uint32_t i = copy_next_;
++  copy_next_ = (copy_next_ + 1) % 4;
++  if (copy_fence_pending_[i]) {
++    dfn.vkWaitForFences(vk_device, 1, &copy_fences_[i], VK_TRUE, UINT64_MAX);
++    dfn.vkResetFences(vk_device, 1, &copy_fences_[i]);
++    copy_fence_pending_[i] = false;
++  }
++  VkCommandBuffer cb = copy_buffers_[i];
++  dfn.vkResetCommandBuffer(cb, 0);
++  VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  if (dfn.vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) {
++    return false;
++  }
++  const VkImageLayout internal = ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
++  VkImageMemoryBarrier barriers[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER},
++                                      {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
++  for (VkImageMemoryBarrier& b : barriers) {
++    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++  }
++  barriers[0].image = source.image;
++  barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  barriers[0].oldLayout = internal;
++  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  barriers[1].image = destination;
++  barriers[1].srcAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
++  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                           0, nullptr, 0, nullptr, 2, barriers);
++  VkImageCopy region = {};
++  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  region.extent = {width, height, 1};
++  dfn.vkCmdCopyImage(cb, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++  barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++  barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++  barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++  barriers[0].newLayout = internal;
++  barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  barriers[1].dstAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
++  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  barriers[1].newLayout = internal;
++  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           0, 0, nullptr, 0, nullptr, 2, barriers);
++  if (dfn.vkEndCommandBuffer(cb) != VK_SUCCESS) {
++    return false;
++  }
++  VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  submit.commandBufferCount = 1;
++  submit.pCommandBuffers = &cb;
++  VkResult result;
++  {
++    ui::vulkan::VulkanDevice::Queue::Acquisition queue =
++        device->AcquireQueue(device->queue_family_graphics_compute(), 0);
++    result = dfn.vkQueueSubmit(queue.queue(), 1, &submit, copy_fences_[i]);
++  }
++  copy_fence_pending_[i] = result == VK_SUCCESS;
++  return result == VK_SUCCESS;
++}
++
++void FrameGenerator::PacerMain() {
++  while (true) {
++    Entry entry;
++    ui::Presenter* presenter;
++    bool skip_interp = false;
++    {
++      std::unique_lock<std::mutex> lock(pacer_mutex_);
++      pacer_cv_.wait(lock, [&] { return pacer_stop_ || !pacer_queue_.empty(); });
++      if (pacer_stop_) {
++        return;
++      }
++      entry = pacer_queue_.front();
++      pacer_queue_.pop_front();
++      // Behind (the display is slower than twice the guest rate): drop this interpolated frame.
++      skip_interp = !pacer_queue_.empty();
++      presenter = presenter_;
++    }
++    for (int k = 0; k <= kMaxGenerated && presenter; ++k) {
++      const bool interp = k < kMaxGenerated;
++      if (interp && (k >= entry.interp_count || skip_interp)) {
++        continue;
++      }
++      if (!interp && entry.interp_count && REXCVAR_GET(gpu_frame_generation_debug_interp_only)) {
++        continue;
++      }
++      const OutputImage& source = output(entry.slot, k);
++      const bool is_8bpc = interp ? entry.interp_8bpc[k] : entry.real_8bpc;
++      presenter->RefreshGuestOutput(
++          entry.width, entry.height, entry.display_width, entry.display_height,
++          [&](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
++            auto& vulkan_context =
++                static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
++            context.SetIs8bpc(is_8bpc);
++            return CopyToPresenter(source, vulkan_context.image(), entry.width, entry.height);
++          });
++    }
++    {
++      std::lock_guard<std::mutex> lock(pacer_mutex_);
++      slot_busy_[entry.slot] = false;
++    }
++    pacer_cv_.notify_all();
++  }
++}
++
++}  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/frame_generation.h b/src/graphics/vulkan/frame_generation.h
+new file mode 100755
+index 0000000..8109a09
+--- /dev/null
++++ b/src/graphics/vulkan/frame_generation.h
+@@ -0,0 +1,138 @@
++/**
++ * @file        frame_generation.h
++ * @brief       Motion-compensated frame interpolation of the guest output (frame generation).
++ *
++ * Between two guest frames the generator estimates block motion on quarter-resolution luma
++ * (full search, 3x3 vector median) and renders the frame at time t by sampling the previous frame
++ * backward and the current one forward along the motion, falling back to a cross-fade where the two
++ * disagree (occlusions, bad vectors). All passes are compute work recorded into the command
++ * processor's command buffer ahead of the swap, at guest-output resolution.
++ */
++
++#pragma once
++
++#include <array>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <thread>
++
++#include <rex/ui/vulkan/api.h>
++
++namespace rex::ui {
++class Presenter;
++}
++namespace rex::ui::vulkan {
++class VulkanDevice;
++}
++
++namespace rex::graphics::vulkan {
++
++class VulkanCommandProcessor;
++
++class FrameGenerator {
++ public:
++  explicit FrameGenerator(VulkanCommandProcessor& command_processor);
++  ~FrameGenerator();
++
++  bool Initialize();
++  void Shutdown();
++
++  // Records the passes producing the frame at time t (0..1) between the frame given to the
++  // previous call and `current` (a view in SHADER_READ_ONLY_OPTIMAL, sampled with the RGB order the
++  // swap expects), then keeps `current` as the next call's previous frame. Must be called outside a
++  // render pass. Returns whether an interpolated frame was produced (false on the first frame or
++  // after a size change); interpolated_view() is then in SHADER_READ_ONLY_OPTIMAL.
++  static constexpr int kMaxGenerated = 3;
++  // Produces `count` (<= kMaxGenerated) frames at the times `t` (ascending, in (0, 1)).
++  int Record(VkImageView current, uint32_t width, uint32_t height, const float* t, int count);
++  VkImageView interpolated_view(int k) const { return interp_[k].view; }
++
++  // Presentation. The swap renders the interpolated and the real frame (through the usual swap
++  // refresher) into one of two slots of guest-output-format images; a pacer thread then hands them
++  // to the presenter one after the other, so FIFO presentation shows them on consecutive vblanks
++  // and only the pacer ever waits for the display.
++  struct OutputImage {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++    uint64_t version = 0;
++    bool written = false;
++  };
++  struct Entry {
++    int slot = -1;
++    int interp_count = 0;
++    bool interp_8bpc[kMaxGenerated] = {true, true, true};
++    bool real_8bpc = true;
++    uint32_t width = 0, height = 0, display_width = 0, display_height = 0;
++  };
++  // Waits (bounded) until the pacer no longer uses the next slot; returns it, or -1.
++  int AcquireSlot();
++  void ReleaseSlot(int slot);
++  bool EnsureOutputs(uint32_t width, uint32_t height);
++  // Index 0..kMaxGenerated-1: generated frames; kMaxGenerated: the real frame.
++  OutputImage& output(int slot, int index) { return outputs_[slot * (kMaxGenerated + 1) + index]; }
++  void Submit(const Entry& entry, ui::Presenter* presenter);
++
++ private:
++  struct Image {
++    VkImage image = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    VkImageView view = VK_NULL_HANDLE;
++    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++  };
++  enum Pass { kLuma, kMatch, kMedian, kInterp, kCopy, kPassCount };
++  static constexpr uint32_t kSlots = 8;
++
++  bool EnsureImages(uint32_t width, uint32_t height);
++  void PacerMain();
++  bool CopyToPresenter(const OutputImage& source, VkImage destination, uint32_t width,
++                       uint32_t height);
++  void DestroyOutputs();
++  bool CreateImage(Image& image, uint32_t width, uint32_t height);
++  void DestroyImage(Image& image);
++  void DestroyImages();
++  void Transition(Image& image, VkImageLayout new_layout, VkPipelineStageFlags src_stage,
++                  VkAccessFlags src_access);
++  void Dispatch(Pass pass, VkDescriptorSet set, const int32_t a[4], const float b[4],
++                uint32_t groups_x, uint32_t groups_y);
++
++  VulkanCommandProcessor& command_processor_;
++  VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
++  VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
++  VkDescriptorPool pool_ = VK_NULL_HANDLE;
++  VkSampler sampler_ = VK_NULL_HANDLE;
++  std::array<VkPipeline, kPassCount> pipelines_{};
++  // Per slot: one set per pass, plus sets for the 2nd and 3rd generated frame.
++  static constexpr uint32_t kSetsPerSlot = kPassCount + kMaxGenerated - 1;
++  std::array<std::array<VkDescriptorSet, kSetsPerSlot>, kSlots> sets_{};
++  uint32_t slot_ = 0;
++
++  uint32_t width_ = 0, height_ = 0;
++  Image prev_, mv_raw_, mv_;
++  Image interp_[kMaxGenerated];
++  Image luma_[2];
++  uint32_t luma_current_ = 0;
++  bool has_prev_ = false;
++  bool has_mv_ = false;
++
++  OutputImage outputs_[2 * (kMaxGenerated + 1)];
++  uint32_t output_width_ = 0, output_height_ = 0;
++  uint64_t next_version_ = uint64_t(0x46470000) << 32;
++  int next_slot_ = 0;
++  std::mutex pacer_mutex_;
++  std::condition_variable pacer_cv_;
++  std::deque<Entry> pacer_queue_;
++  bool slot_busy_[2] = {};
++  bool pacer_stop_ = false;
++  ui::Presenter* presenter_ = nullptr;
++  std::thread pacer_;
++  VkCommandPool copy_pool_ = VK_NULL_HANDLE;
++  VkCommandBuffer copy_buffers_[4] = {};
++  VkFence copy_fences_[4] = {};
++  bool copy_fence_pending_[4] = {};
++  uint32_t copy_next_ = 0;
++};
++
++}  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/frame_generation_shaders.inc b/src/graphics/vulkan/frame_generation_shaders.inc
+new file mode 100755
+index 0000000..150d0d7
+--- /dev/null
++++ b/src/graphics/vulkan/frame_generation_shaders.inc
+@@ -0,0 +1,870 @@
++// Generated by glslc -O from the fg_*.comp sources (frame generation).
++const uint32_t kFg_luma[] = {
++0x07230203,0x00010000,0x000d000a,0x0000007e,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00060010,0x00000004,
++0x00000011,0x00000008,0x00000008,0x00000001,
++0x00040047,0x0000000d,0x0000000b,0x0000001c,
++0x00050048,0x00000016,0x00000000,0x00000023,
++0x00000000,0x00050048,0x00000016,0x00000001,
++0x00000023,0x00000010,0x00030047,0x00000016,
++0x00000002,0x00040047,0x0000003e,0x00000022,
++0x00000000,0x00040047,0x0000003e,0x00000021,
++0x00000000,0x00040047,0x00000067,0x00000022,
++0x00000000,0x00040047,0x00000067,0x00000021,
++0x00000003,0x00030047,0x00000067,0x00000019,
++0x00040047,0x00000075,0x0000000b,0x00000019,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00040017,0x00000007,0x00000006,
++0x00000002,0x00040015,0x0000000a,0x00000020,
++0x00000000,0x00040017,0x0000000b,0x0000000a,
++0x00000003,0x00040020,0x0000000c,0x00000001,
++0x0000000b,0x0004003b,0x0000000c,0x0000000d,
++0x00000001,0x00040017,0x0000000e,0x0000000a,
++0x00000002,0x00040017,0x00000013,0x00000006,
++0x00000004,0x00030016,0x00000014,0x00000020,
++0x00040017,0x00000015,0x00000014,0x00000004,
++0x0004001e,0x00000016,0x00000013,0x00000015,
++0x00040020,0x00000017,0x00000009,0x00000016,
++0x0004003b,0x00000017,0x00000018,0x00000009,
++0x0004002b,0x00000006,0x00000019,0x00000000,
++0x00040020,0x0000001a,0x00000009,0x00000013,
++0x00020014,0x0000001e,0x00040017,0x0000001f,
++0x0000001e,0x00000002,0x00040017,0x00000025,
++0x00000014,0x00000002,0x0004002b,0x00000014,
++0x0000002a,0x3f000000,0x0004002b,0x00000006,
++0x00000033,0x00000001,0x00040020,0x00000034,
++0x00000009,0x00000015,0x00040017,0x00000038,
++0x00000014,0x00000003,0x00090019,0x0000003b,
++0x00000014,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000001,0x00000000,0x0003001b,
++0x0000003c,0x0000003b,0x00040020,0x0000003d,
++0x00000000,0x0000003c,0x0004003b,0x0000003d,
++0x0000003e,0x00000000,0x0004002b,0x00000014,
++0x00000042,0xbf800000,0x0005002c,0x00000025,
++0x00000043,0x00000042,0x00000042,0x0004002b,
++0x00000014,0x00000046,0x00000000,0x0004002b,
++0x00000014,0x0000004c,0x3f800000,0x0005002c,
++0x00000025,0x0000004d,0x0000004c,0x00000042,
++0x0005002c,0x00000025,0x00000056,0x00000042,
++0x0000004c,0x00090019,0x00000065,0x00000014,
++0x00000001,0x00000000,0x00000000,0x00000000,
++0x00000002,0x00000002,0x00040020,0x00000066,
++0x00000000,0x00000065,0x0004003b,0x00000066,
++0x00000067,0x00000000,0x0004002b,0x00000014,
++0x0000006b,0x3e800000,0x0004002b,0x00000014,
++0x0000006d,0x3e991687,0x0004002b,0x00000014,
++0x0000006e,0x3f1645a2,0x0004002b,0x00000014,
++0x0000006f,0x3de978d5,0x0006002c,0x00000038,
++0x00000070,0x0000006d,0x0000006e,0x0000006f,
++0x0004002b,0x0000000a,0x00000073,0x00000008,
++0x0004002b,0x0000000a,0x00000074,0x00000001,
++0x0006002c,0x0000000b,0x00000075,0x00000073,
++0x00000073,0x00000074,0x0004002b,0x0000000a,
++0x00000078,0x00000000,0x0005002c,0x00000025,
++0x0000007d,0x0000002a,0x0000002a,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x000300f7,0x00000076,
++0x00000000,0x000300fb,0x00000078,0x00000077,
++0x000200f8,0x00000077,0x0004003d,0x0000000b,
++0x0000000f,0x0000000d,0x0007004f,0x0000000e,
++0x00000010,0x0000000f,0x0000000f,0x00000000,
++0x00000001,0x0004007c,0x00000007,0x00000011,
++0x00000010,0x00050041,0x0000001a,0x0000001b,
++0x00000018,0x00000019,0x0004003d,0x00000013,
++0x0000001c,0x0000001b,0x0007004f,0x00000007,
++0x0000001d,0x0000001c,0x0000001c,0x00000000,
++0x00000001,0x000500af,0x0000001f,0x00000020,
++0x00000011,0x0000001d,0x0004009a,0x0000001e,
++0x00000021,0x00000020,0x000300f7,0x00000023,
++0x00000000,0x000400fa,0x00000021,0x00000022,
++0x00000023,0x000200f8,0x00000022,0x000200f9,
++0x00000076,0x000200f8,0x00000023,0x0004006f,
++0x00000025,0x00000029,0x00000011,0x00050081,
++0x00000025,0x0000002c,0x00000029,0x0000007d,
++0x0004006f,0x00000025,0x00000030,0x0000001d,
++0x00050088,0x00000025,0x00000031,0x0000002c,
++0x00000030,0x00050041,0x00000034,0x00000035,
++0x00000018,0x00000033,0x0004003d,0x00000015,
++0x00000036,0x00000035,0x0007004f,0x00000025,
++0x00000037,0x00000036,0x00000036,0x00000000,
++0x00000001,0x0004003d,0x0000003c,0x0000003f,
++0x0000003e,0x0008000c,0x00000025,0x00000045,
++0x00000001,0x00000032,0x00000037,0x00000043,
++0x00000031,0x00070058,0x00000015,0x00000047,
++0x0000003f,0x00000045,0x00000002,0x00000046,
++0x0008004f,0x00000038,0x00000048,0x00000047,
++0x00000047,0x00000000,0x00000001,0x00000002,
++0x0008000c,0x00000025,0x0000004f,0x00000001,
++0x00000032,0x00000037,0x0000004d,0x00000031,
++0x00070058,0x00000015,0x00000050,0x0000003f,
++0x0000004f,0x00000002,0x00000046,0x0008004f,
++0x00000038,0x00000051,0x00000050,0x00000050,
++0x00000000,0x00000001,0x00000002,0x00050081,
++0x00000038,0x00000052,0x00000048,0x00000051,
++0x0008000c,0x00000025,0x00000058,0x00000001,
++0x00000032,0x00000037,0x00000056,0x00000031,
++0x00070058,0x00000015,0x00000059,0x0000003f,
++0x00000058,0x00000002,0x00000046,0x0008004f,
++0x00000038,0x0000005a,0x00000059,0x00000059,
++0x00000000,0x00000001,0x00000002,0x00050081,
++0x00000038,0x0000005b,0x00000052,0x0000005a,
++0x00050081,0x00000025,0x00000061,0x00000031,
++0x00000037,0x00070058,0x00000015,0x00000062,
++0x0000003f,0x00000061,0x00000002,0x00000046,
++0x0008004f,0x00000038,0x00000063,0x00000062,
++0x00000062,0x00000000,0x00000001,0x00000002,
++0x00050081,0x00000038,0x00000064,0x0000005b,
++0x00000063,0x0004003d,0x00000065,0x00000068,
++0x00000067,0x0005008e,0x00000038,0x0000006c,
++0x00000064,0x0000006b,0x00050094,0x00000014,
++0x00000071,0x0000006c,0x00000070,0x00070050,
++0x00000015,0x00000072,0x00000071,0x00000071,
++0x00000071,0x00000071,0x00040063,0x00000068,
++0x00000011,0x00000072,0x000200f9,0x00000076,
++0x000200f8,0x00000076,0x000100fd,0x00010038
++};
++const uint32_t kFg_match[] = {
++0x07230203,0x00010000,0x000d000a,0x00000187,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000004d,0x00060010,0x00000004,
++0x00000011,0x00000008,0x00000008,0x00000001,
++0x00040047,0x0000002b,0x00000022,0x00000000,
++0x00040047,0x0000002b,0x00000021,0x00000000,
++0x00040047,0x0000004d,0x0000000b,0x0000001c,
++0x00050048,0x00000054,0x00000000,0x00000023,
++0x00000000,0x00050048,0x00000054,0x00000001,
++0x00000023,0x00000010,0x00030047,0x00000054,
++0x00000002,0x00040047,0x00000075,0x00000022,
++0x00000000,0x00040047,0x00000075,0x00000021,
++0x00000001,0x00040047,0x00000092,0x00000022,
++0x00000000,0x00040047,0x00000092,0x00000021,
++0x00000002,0x00040047,0x00000104,0x00000022,
++0x00000000,0x00040047,0x00000104,0x00000021,
++0x00000003,0x00030047,0x00000104,0x00000019,
++0x00040047,0x00000113,0x0000000b,0x00000019,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00040017,0x00000007,0x00000006,
++0x00000002,0x00030016,0x00000009,0x00000020,
++0x00040020,0x00000010,0x00000007,0x00000009,
++0x0004002b,0x00000009,0x00000012,0x00000000,
++0x0004002b,0x00000006,0x00000015,0x00000000,
++0x0004002b,0x00000006,0x0000001c,0x00000010,
++0x00020014,0x0000001d,0x00040015,0x0000001f,
++0x00000020,0x00000000,0x0004002b,0x0000001f,
++0x00000020,0x00000010,0x0004001c,0x00000021,
++0x00000009,0x00000020,0x00090019,0x00000028,
++0x00000009,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000001,0x00000000,0x0003001b,
++0x00000029,0x00000028,0x00040020,0x0000002a,
++0x00000000,0x00000029,0x0004003b,0x0000002a,
++0x0000002b,0x00000000,0x0004002b,0x00000006,
++0x0000002f,0x00000003,0x0004002b,0x00000006,
++0x00000032,0x00000002,0x0005002c,0x00000007,
++0x00000038,0x00000015,0x00000015,0x00040017,
++0x0000003c,0x00000009,0x00000004,0x0004002b,
++0x0000001f,0x0000003e,0x00000000,0x0004002b,
++0x00000006,0x00000045,0x00000001,0x00040017,
++0x0000004b,0x0000001f,0x00000003,0x00040020,
++0x0000004c,0x00000001,0x0000004b,0x0004003b,
++0x0000004c,0x0000004d,0x00000001,0x00040017,
++0x0000004e,0x0000001f,0x00000002,0x00040017,
++0x00000053,0x00000006,0x00000004,0x0004001e,
++0x00000054,0x00000053,0x0000003c,0x00040020,
++0x00000055,0x00000009,0x00000054,0x0004003b,
++0x00000055,0x00000056,0x00000009,0x00040020,
++0x00000057,0x00000009,0x00000053,0x00040017,
++0x0000005b,0x0000001d,0x00000002,0x0004002b,
++0x00000006,0x00000063,0x00000004,0x0004003b,
++0x0000002a,0x00000075,0x00000000,0x00040017,
++0x00000086,0x00000009,0x00000002,0x0004002b,
++0x0000001f,0x00000089,0x00000002,0x00040020,
++0x0000008a,0x00000009,0x00000009,0x0004002b,
++0x00000009,0x0000008d,0x3f000000,0x0004003b,
++0x0000002a,0x00000092,0x00000000,0x0004002b,
++0x00000009,0x00000099,0x3e800000,0x0005002c,
++0x00000086,0x0000009c,0x00000012,0x00000012,
++0x0004002b,0x00000009,0x000000a0,0xc1c00000,
++0x0005002c,0x00000086,0x000000a1,0x000000a0,
++0x000000a0,0x0004002b,0x00000009,0x000000a2,
++0x41c00000,0x0005002c,0x00000086,0x000000a3,
++0x000000a2,0x000000a2,0x0004002b,0x0000001f,
++0x000000a8,0x00000001,0x00090019,0x00000102,
++0x00000009,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000002,0x00040020,
++0x00000103,0x00000000,0x00000102,0x0004003b,
++0x00000103,0x00000104,0x00000000,0x0004002b,
++0x00000009,0x0000010a,0x40800000,0x0004002b,
++0x0000001f,0x00000112,0x00000008,0x0006002c,
++0x0000004b,0x00000113,0x00000112,0x00000112,
++0x000000a8,0x00040020,0x00000162,0x00000007,
++0x00000021,0x0005002c,0x00000007,0x0000017e,
++0x00000063,0x00000063,0x0005002c,0x00000007,
++0x0000017f,0x00000045,0x00000045,0x0004002b,
++0x00000009,0x00000183,0x3d800000,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x0004003b,0x00000162,
++0x00000023,0x00000007,0x000300f7,0x00000114,
++0x00000000,0x000300fb,0x0000003e,0x00000115,
++0x000200f8,0x00000115,0x0004003d,0x0000004b,
++0x0000004f,0x0000004d,0x0007004f,0x0000004e,
++0x00000050,0x0000004f,0x0000004f,0x00000000,
++0x00000001,0x0004007c,0x00000007,0x00000051,
++0x00000050,0x00050041,0x00000057,0x00000058,
++0x00000056,0x00000015,0x0004003d,0x00000053,
++0x00000059,0x00000058,0x0007004f,0x00000007,
++0x0000005a,0x00000059,0x00000059,0x00000000,
++0x00000001,0x000500af,0x0000005b,0x0000005c,
++0x00000051,0x0000005a,0x0004009a,0x0000001d,
++0x0000005d,0x0000005c,0x000300f7,0x0000005f,
++0x00000000,0x000400fa,0x0000005d,0x0000005e,
++0x0000005f,0x000200f8,0x0000005e,0x000200f9,
++0x00000114,0x000200f8,0x0000005f,0x00050084,
++0x00000007,0x00000065,0x00000051,0x0000017e,
++0x0007004f,0x00000007,0x00000069,0x00000059,
++0x00000059,0x00000002,0x00000003,0x00050082,
++0x00000007,0x0000006b,0x00000069,0x0000017f,
++0x000200f9,0x0000006d,0x000200f8,0x0000006d,
++0x000700f5,0x00000006,0x00000169,0x00000015,
++0x0000005f,0x00000085,0x0000006e,0x000500b1,
++0x0000001d,0x00000073,0x00000169,0x0000001c,
++0x000400f6,0x0000006f,0x0000006e,0x00000000,
++0x000400fa,0x00000073,0x0000006e,0x0000006f,
++0x000200f8,0x0000006e,0x0004003d,0x00000029,
++0x00000076,0x00000075,0x000500c7,0x00000006,
++0x00000079,0x00000169,0x0000002f,0x000500c3,
++0x00000006,0x0000007b,0x00000169,0x00000032,
++0x00050050,0x00000007,0x0000007c,0x00000079,
++0x0000007b,0x00050080,0x00000007,0x0000007d,
++0x00000065,0x0000007c,0x0008000c,0x00000007,
++0x0000007f,0x00000001,0x0000002d,0x0000007d,
++0x00000038,0x0000006b,0x00040064,0x00000028,
++0x00000080,0x00000076,0x0007005f,0x0000003c,
++0x00000081,0x00000080,0x0000007f,0x00000002,
++0x00000015,0x00050051,0x00000009,0x00000082,
++0x00000081,0x00000000,0x00050041,0x00000010,
++0x00000083,0x00000023,0x00000169,0x0003003e,
++0x00000083,0x00000082,0x00050080,0x00000006,
++0x00000085,0x00000169,0x00000045,0x000200f9,
++0x0000006d,0x000200f8,0x0000006f,0x00060041,
++0x0000008a,0x0000008b,0x00000056,0x00000045,
++0x00000089,0x0004003d,0x00000009,0x0000008c,
++0x0000008b,0x000500ba,0x0000001d,0x0000008e,
++0x0000008c,0x0000008d,0x000300f7,0x00000091,
++0x00000000,0x000400fa,0x0000008e,0x00000090,
++0x0000009b,0x000200f8,0x00000090,0x0004003d,
++0x00000029,0x00000093,0x00000092,0x00040064,
++0x00000028,0x00000095,0x00000093,0x0007005f,
++0x0000003c,0x00000096,0x00000095,0x00000051,
++0x00000002,0x00000015,0x0007004f,0x00000086,
++0x00000097,0x00000096,0x00000096,0x00000000,
++0x00000001,0x0004007f,0x00000086,0x00000098,
++0x00000097,0x0005008e,0x00000086,0x0000009a,
++0x00000098,0x00000099,0x000200f9,0x00000091,
++0x000200f8,0x0000009b,0x000200f9,0x00000091,
++0x000200f8,0x00000091,0x000700f5,0x00000086,
++0x0000016a,0x0000009a,0x00000090,0x0000009c,
++0x0000009b,0x0008000c,0x00000086,0x000000a4,
++0x00000001,0x0000002b,0x0000016a,0x000000a1,
++0x000000a3,0x0006000c,0x00000086,0x000000a5,
++0x00000001,0x00000001,0x000000a4,0x0004006e,
++0x00000007,0x000000a6,0x000000a5,0x00060041,
++0x0000008a,0x000000a9,0x00000056,0x00000045,
++0x000000a8,0x0004003d,0x00000009,0x000000aa,
++0x000000a9,0x0004006e,0x00000006,0x000000ab,
++0x000000aa,0x000200f9,0x0000011e,0x000200f8,
++0x0000011e,0x000700f5,0x00000009,0x0000016c,
++0x00000012,0x00000091,0x00000138,0x00000122,
++0x000700f5,0x00000006,0x0000016b,0x00000015,
++0x00000091,0x0000013b,0x00000122,0x000500b1,
++0x0000001d,0x00000121,0x0000016b,0x0000001c,
++0x000400f6,0x0000013c,0x00000122,0x00000000,
++0x000400fa,0x00000121,0x00000122,0x0000013c,
++0x000200f8,0x00000122,0x00050041,0x00000010,
++0x00000124,0x00000023,0x0000016b,0x0004003d,
++0x00000009,0x00000125,0x00000124,0x0004003d,
++0x00000029,0x00000126,0x0000002b,0x000500c7,
++0x00000006,0x00000129,0x0000016b,0x0000002f,
++0x000500c3,0x00000006,0x0000012b,0x0000016b,
++0x00000032,0x00050050,0x00000007,0x0000012c,
++0x00000129,0x0000012b,0x00050080,0x00000007,
++0x0000012d,0x00000065,0x0000012c,0x0008000c,
++0x00000007,0x00000131,0x00000001,0x0000002d,
++0x0000012d,0x00000038,0x0000006b,0x00040064,
++0x00000028,0x00000132,0x00000126,0x0007005f,
++0x0000003c,0x00000133,0x00000132,0x00000131,
++0x00000002,0x00000015,0x00050051,0x00000009,
++0x00000134,0x00000133,0x00000000,0x00050083,
++0x00000009,0x00000135,0x00000125,0x00000134,
++0x0006000c,0x00000009,0x00000136,0x00000001,
++0x00000004,0x00000135,0x00050081,0x00000009,
++0x00000138,0x0000016c,0x00000136,0x00050080,
++0x00000006,0x0000013b,0x0000016b,0x00000045,
++0x000200f9,0x0000011e,0x000200f8,0x0000013c,
++0x00060041,0x0000008a,0x000000b3,0x00000056,
++0x00000045,0x0000003e,0x0004003d,0x00000009,
++0x000000b4,0x000000b3,0x00050051,0x00000009,
++0x000000b6,0x0000016a,0x00000000,0x0006000c,
++0x00000009,0x000000b7,0x00000001,0x00000004,
++0x000000b6,0x00050051,0x00000009,0x000000b9,
++0x0000016a,0x00000001,0x0006000c,0x00000009,
++0x000000ba,0x00000001,0x00000004,0x000000b9,
++0x00050081,0x00000009,0x000000bb,0x000000b7,
++0x000000ba,0x00050085,0x00000009,0x000000bc,
++0x000000b4,0x000000bb,0x0008000c,0x00000009,
++0x000000be,0x00000001,0x00000032,0x000000bc,
++0x0000008d,0x0000016c,0x0004007e,0x00000006,
++0x000000c2,0x000000ab,0x000200f9,0x000000c3,
++0x000200f8,0x000000c3,0x000700f5,0x00000009,
++0x0000016f,0x000000be,0x0000013c,0x00000175,
++0x000000c6,0x000700f5,0x00000007,0x0000016e,
++0x00000038,0x0000013c,0x00000178,0x000000c6,
++0x000700f5,0x00000006,0x0000016d,0x000000c2,
++0x0000013c,0x00000101,0x000000c6,0x000500b3,
++0x0000001d,0x000000ca,0x0000016d,0x000000ab,
++0x000400f6,0x000000c5,0x000000c6,0x00000000,
++0x000400fa,0x000000ca,0x000000c4,0x000000c5,
++0x000200f8,0x000000c4,0x000200f9,0x000000ce,
++0x000200f8,0x000000ce,0x000700f5,0x00000009,
++0x00000175,0x0000016f,0x000000c4,0x00000184,
++0x000000d1,0x000700f5,0x00000006,0x00000170,
++0x000000c2,0x000000c4,0x000000ff,0x000000d1,
++0x000700f5,0x00000007,0x00000178,0x0000016e,
++0x000000c4,0x00000186,0x000000d1,0x000500b3,
++0x0000001d,0x000000d5,0x00000170,0x000000ab,
++0x000400f6,0x000000d0,0x000000d1,0x00000000,
++0x000400fa,0x000000d5,0x000000cf,0x000000d0,
++0x000200f8,0x000000cf,0x00050050,0x00000007,
++0x000000da,0x00000170,0x0000016d,0x00050080,
++0x00000007,0x000000db,0x000000a6,0x000000da,
++0x000200f9,0x00000142,0x000200f8,0x00000142,
++0x000700f5,0x00000009,0x00000173,0x00000012,
++0x000000cf,0x0000015c,0x00000146,0x000700f5,
++0x00000006,0x00000172,0x00000015,0x000000cf,
++0x0000015f,0x00000146,0x000500b1,0x0000001d,
++0x00000145,0x00000172,0x0000001c,0x000400f6,
++0x00000160,0x00000146,0x00000000,0x000400fa,
++0x00000145,0x00000146,0x00000160,0x000200f8,
++0x00000146,0x00050041,0x00000010,0x00000148,
++0x00000023,0x00000172,0x0004003d,0x00000009,
++0x00000149,0x00000148,0x0004003d,0x00000029,
++0x0000014a,0x0000002b,0x000500c7,0x00000006,
++0x0000014d,0x00000172,0x0000002f,0x000500c3,
++0x00000006,0x0000014f,0x00000172,0x00000032,
++0x00050050,0x00000007,0x00000150,0x0000014d,
++0x0000014f,0x00050080,0x00000007,0x00000151,
++0x00000065,0x00000150,0x00050080,0x00000007,
++0x00000153,0x00000151,0x000000db,0x0008000c,
++0x00000007,0x00000155,0x00000001,0x0000002d,
++0x00000153,0x00000038,0x0000006b,0x00040064,
++0x00000028,0x00000156,0x0000014a,0x0007005f,
++0x0000003c,0x00000157,0x00000156,0x00000155,
++0x00000002,0x00000015,0x00050051,0x00000009,
++0x00000158,0x00000157,0x00000000,0x00050083,
++0x00000009,0x00000159,0x00000149,0x00000158,
++0x0006000c,0x00000009,0x0000015a,0x00000001,
++0x00000004,0x00000159,0x00050081,0x00000009,
++0x0000015c,0x00000173,0x0000015a,0x00050080,
++0x00000006,0x0000015f,0x00000172,0x00000045,
++0x000200f9,0x00000142,0x000200f8,0x00000160,
++0x00050051,0x00000006,0x000000e7,0x000000db,
++0x00000000,0x0004006f,0x00000009,0x000000e8,
++0x000000e7,0x00050083,0x00000009,0x000000eb,
++0x000000e8,0x000000b6,0x0006000c,0x00000009,
++0x000000ec,0x00000001,0x00000004,0x000000eb,
++0x00050051,0x00000006,0x000000ee,0x000000db,
++0x00000001,0x0004006f,0x00000009,0x000000ef,
++0x000000ee,0x00050083,0x00000009,0x000000f2,
++0x000000ef,0x000000b9,0x0006000c,0x00000009,
++0x000000f3,0x00000001,0x00000004,0x000000f2,
++0x00050081,0x00000009,0x000000f4,0x000000ec,
++0x000000f3,0x0008000c,0x00000009,0x000000f6,
++0x00000001,0x00000032,0x000000b4,0x000000f4,
++0x00000173,0x000500b8,0x0000001d,0x000000f9,
++0x000000f6,0x00000175,0x000600a9,0x00000009,
++0x00000184,0x000000f9,0x000000f6,0x00000175,
++0x00050050,0x0000005b,0x00000185,0x000000f9,
++0x000000f9,0x000600a9,0x00000007,0x00000186,
++0x00000185,0x000000db,0x00000178,0x000200f9,
++0x000000d1,0x000200f8,0x000000d1,0x00050080,
++0x00000006,0x000000ff,0x00000170,0x00000045,
++0x000200f9,0x000000ce,0x000200f8,0x000000d0,
++0x000200f9,0x000000c6,0x000200f8,0x000000c6,
++0x00050080,0x00000006,0x00000101,0x0000016d,
++0x00000045,0x000200f9,0x000000c3,0x000200f8,
++0x000000c5,0x0004003d,0x00000102,0x00000105,
++0x00000104,0x0004006f,0x00000086,0x00000108,
++0x0000016e,0x0004007f,0x00000086,0x00000109,
++0x00000108,0x0005008e,0x00000086,0x0000010b,
++0x00000109,0x0000010a,0x00050085,0x00000009,
++0x0000010e,0x0000016f,0x00000183,0x00050051,
++0x00000009,0x0000010f,0x0000010b,0x00000000,
++0x00050051,0x00000009,0x00000110,0x0000010b,
++0x00000001,0x00070050,0x0000003c,0x00000111,
++0x0000010f,0x00000110,0x0000010e,0x00000012,
++0x00040063,0x00000105,0x00000051,0x00000111,
++0x000200f9,0x00000114,0x000200f8,0x00000114,
++0x000100fd,0x00010038
++};
++const uint32_t kFg_median[] = {
++0x07230203,0x00010000,0x000d000a,0x0000013a,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000004c,0x00060010,0x00000004,
++0x00000011,0x00000008,0x00000008,0x00000001,
++0x00040047,0x0000004c,0x0000000b,0x0000001c,
++0x00050048,0x00000054,0x00000000,0x00000023,
++0x00000000,0x00050048,0x00000054,0x00000001,
++0x00000023,0x00000010,0x00030047,0x00000054,
++0x00000002,0x00040047,0x0000007a,0x00000022,
++0x00000000,0x00040047,0x0000007a,0x00000021,
++0x00000000,0x00040047,0x000000a8,0x00000022,
++0x00000000,0x00040047,0x000000a8,0x00000021,
++0x00000003,0x00030047,0x000000a8,0x00000019,
++0x00040047,0x000000b4,0x0000000b,0x00000019,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00030016,0x00000006,0x00000020,
++0x00040015,0x00000007,0x00000020,0x00000000,
++0x0004002b,0x00000007,0x00000008,0x00000009,
++0x0004001c,0x00000009,0x00000006,0x00000008,
++0x00040020,0x0000000a,0x00000007,0x00000009,
++0x00040015,0x0000000f,0x00000020,0x00000001,
++0x0004002b,0x0000000f,0x00000012,0x00000000,
++0x0004002b,0x0000000f,0x00000019,0x00000005,
++0x00020014,0x0000001a,0x0004002b,0x0000000f,
++0x0000001e,0x00000001,0x0004002b,0x0000000f,
++0x00000026,0x00000009,0x00040020,0x00000029,
++0x00000007,0x00000006,0x0004002b,0x0000000f,
++0x00000042,0x00000004,0x00040017,0x00000047,
++0x0000000f,0x00000002,0x00040017,0x0000004a,
++0x00000007,0x00000003,0x00040020,0x0000004b,
++0x00000001,0x0000004a,0x0004003b,0x0000004b,
++0x0000004c,0x00000001,0x00040017,0x0000004d,
++0x00000007,0x00000002,0x00040017,0x00000052,
++0x0000000f,0x00000004,0x00040017,0x00000053,
++0x00000006,0x00000004,0x0004001e,0x00000054,
++0x00000052,0x00000053,0x00040020,0x00000055,
++0x00000009,0x00000054,0x0004003b,0x00000055,
++0x00000056,0x00000009,0x00040020,0x00000057,
++0x00000009,0x00000052,0x00040017,0x0000005b,
++0x0000001a,0x00000002,0x0004002b,0x00000006,
++0x00000062,0x00000000,0x0004002b,0x0000000f,
++0x00000065,0xffffffff,0x00090019,0x00000077,
++0x00000006,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000001,0x00000000,0x0003001b,
++0x00000078,0x00000077,0x00040020,0x00000079,
++0x00000000,0x00000078,0x0004003b,0x00000079,
++0x0000007a,0x00000000,0x0005002c,0x00000047,
++0x00000081,0x00000012,0x00000012,0x0004002b,
++0x00000007,0x0000008c,0x00000000,0x0004002b,
++0x00000007,0x00000092,0x00000001,0x00090019,
++0x000000a6,0x00000006,0x00000001,0x00000000,
++0x00000000,0x00000000,0x00000002,0x00000002,
++0x00040020,0x000000a7,0x00000000,0x000000a6,
++0x0004003b,0x000000a7,0x000000a8,0x00000000,
++0x0004002b,0x00000007,0x000000b3,0x00000008,
++0x0006002c,0x0000004a,0x000000b4,0x000000b3,
++0x000000b3,0x00000092,0x0005002c,0x00000047,
++0x00000139,0x0000001e,0x0000001e,0x00050036,
++0x00000002,0x00000004,0x00000000,0x00000003,
++0x000200f8,0x00000005,0x0004003b,0x0000000a,
++0x0000008a,0x00000007,0x0004003b,0x0000000a,
++0x00000090,0x00000007,0x0004003b,0x0000000a,
++0x000000ab,0x00000007,0x0004003b,0x0000000a,
++0x000000ae,0x00000007,0x000300f7,0x000000b5,
++0x00000000,0x000300fb,0x0000008c,0x000000b6,
++0x000200f8,0x000000b6,0x0004003d,0x0000004a,
++0x0000004e,0x0000004c,0x0007004f,0x0000004d,
++0x0000004f,0x0000004e,0x0000004e,0x00000000,
++0x00000001,0x0004007c,0x00000047,0x00000050,
++0x0000004f,0x00050041,0x00000057,0x00000058,
++0x00000056,0x00000012,0x0004003d,0x00000052,
++0x00000059,0x00000058,0x0007004f,0x00000047,
++0x0000005a,0x00000059,0x00000059,0x00000000,
++0x00000001,0x000500af,0x0000005b,0x0000005c,
++0x00000050,0x0000005a,0x0004009a,0x0000001a,
++0x0000005d,0x0000005c,0x000300f7,0x0000005f,
++0x00000000,0x000400fa,0x0000005d,0x0000005e,
++0x0000005f,0x000200f8,0x0000005e,0x000200f9,
++0x000000b5,0x000200f8,0x0000005f,0x000200f9,
++0x00000066,0x000200f8,0x00000066,0x000700f5,
++0x00000006,0x00000121,0x00000062,0x0000005f,
++0x0000012e,0x00000069,0x000700f5,0x0000000f,
++0x0000011c,0x00000065,0x0000005f,0x000000a5,
++0x00000069,0x000700f5,0x0000000f,0x0000012b,
++0x00000012,0x0000005f,0x0000012a,0x00000069,
++0x000500b3,0x0000001a,0x0000006c,0x0000011c,
++0x0000001e,0x000400f6,0x00000068,0x00000069,
++0x00000000,0x000400fa,0x0000006c,0x00000067,
++0x00000068,0x000200f8,0x00000067,0x000200f9,
++0x0000006e,0x000200f8,0x0000006e,0x000700f5,
++0x0000000f,0x0000012a,0x0000012b,0x00000067,
++0x000000a1,0x00000071,0x000700f5,0x0000000f,
++0x00000128,0x00000065,0x00000067,0x000000a3,
++0x00000071,0x000700f5,0x00000006,0x0000012e,
++0x00000121,0x00000067,0x0000012f,0x00000071,
++0x000500b3,0x0000001a,0x00000074,0x00000128,
++0x0000001e,0x000400f6,0x00000070,0x00000071,
++0x00000000,0x000400fa,0x00000074,0x0000006f,
++0x00000070,0x000200f8,0x0000006f,0x0004003d,
++0x00000078,0x0000007b,0x0000007a,0x00050050,
++0x00000047,0x0000007f,0x00000128,0x0000011c,
++0x00050080,0x00000047,0x00000080,0x00000050,
++0x0000007f,0x00050082,0x00000047,0x00000086,
++0x0000005a,0x00000139,0x0008000c,0x00000047,
++0x00000087,0x00000001,0x0000002d,0x00000080,
++0x00000081,0x00000086,0x00040064,0x00000077,
++0x00000088,0x0000007b,0x0007005f,0x00000053,
++0x00000089,0x00000088,0x00000087,0x00000002,
++0x00000012,0x00050051,0x00000006,0x0000008e,
++0x00000089,0x00000000,0x00050041,0x00000029,
++0x0000008f,0x0000008a,0x0000012a,0x0003003e,
++0x0000008f,0x0000008e,0x00050051,0x00000006,
++0x00000094,0x00000089,0x00000001,0x00050041,
++0x00000029,0x00000095,0x00000090,0x0000012a,
++0x0003003e,0x00000095,0x00000094,0x000500aa,
++0x0000001a,0x00000097,0x00000128,0x00000012,
++0x000500aa,0x0000001a,0x00000099,0x0000011c,
++0x00000012,0x000500a7,0x0000001a,0x0000009a,
++0x00000097,0x00000099,0x000300f7,0x0000009c,
++0x00000000,0x000400fa,0x0000009a,0x0000009b,
++0x0000009c,0x000200f8,0x0000009b,0x00050051,
++0x00000006,0x0000009f,0x00000089,0x00000002,
++0x000200f9,0x0000009c,0x000200f8,0x0000009c,
++0x000700f5,0x00000006,0x0000012f,0x0000012e,
++0x0000006f,0x0000009f,0x0000009b,0x00050080,
++0x0000000f,0x000000a1,0x0000012a,0x0000001e,
++0x000200f9,0x00000071,0x000200f8,0x00000071,
++0x00050080,0x0000000f,0x000000a3,0x00000128,
++0x0000001e,0x000200f9,0x0000006e,0x000200f8,
++0x00000070,0x000200f9,0x00000069,0x000200f8,
++0x00000069,0x00050080,0x0000000f,0x000000a5,
++0x0000011c,0x0000001e,0x000200f9,0x00000066,
++0x000200f8,0x00000068,0x0004003d,0x000000a6,
++0x000000a9,0x000000a8,0x0004003d,0x00000009,
++0x000000ac,0x0000008a,0x0003003e,0x000000ab,
++0x000000ac,0x000200f9,0x000000c0,0x000200f8,
++0x000000c0,0x000700f5,0x0000000f,0x0000011d,
++0x00000012,0x00000068,0x000000c6,0x000000e4,
++0x000500b1,0x0000001a,0x000000c3,0x0000011d,
++0x00000019,0x000400f6,0x000000e7,0x000000e4,
++0x00000000,0x000400fa,0x000000c3,0x000000c4,
++0x000000e7,0x000200f8,0x000000c4,0x00050080,
++0x0000000f,0x000000c6,0x0000011d,0x0000001e,
++0x000200f9,0x000000c7,0x000200f8,0x000000c7,
++0x000700f5,0x0000000f,0x00000125,0x000000c6,
++0x000000c4,0x000000e2,0x000000e0,0x000500b1,
++0x0000001a,0x000000ca,0x00000125,0x00000026,
++0x000400f6,0x000000e3,0x000000e0,0x00000000,
++0x000400fa,0x000000ca,0x000000cb,0x000000e3,
++0x000200f8,0x000000cb,0x00050041,0x00000029,
++0x000000cd,0x000000ab,0x00000125,0x0004003d,
++0x00000006,0x000000ce,0x000000cd,0x00050041,
++0x00000029,0x000000d0,0x000000ab,0x0000011d,
++0x0004003d,0x00000006,0x000000d1,0x000000d0,
++0x000500b8,0x0000001a,0x000000d2,0x000000ce,
++0x000000d1,0x000300f7,0x000000df,0x00000000,
++0x000400fa,0x000000d2,0x000000d3,0x000000df,
++0x000200f8,0x000000d3,0x0004003d,0x00000006,
++0x000000d6,0x000000d0,0x0004003d,0x00000006,
++0x000000da,0x000000cd,0x0003003e,0x000000d0,
++0x000000da,0x0003003e,0x000000cd,0x000000d6,
++0x000200f9,0x000000df,0x000200f8,0x000000df,
++0x000200f9,0x000000e0,0x000200f8,0x000000e0,
++0x00050080,0x0000000f,0x000000e2,0x00000125,
++0x0000001e,0x000200f9,0x000000c7,0x000200f8,
++0x000000e3,0x000200f9,0x000000e4,0x000200f8,
++0x000000e4,0x000200f9,0x000000c0,0x000200f8,
++0x000000e7,0x00050041,0x00000029,0x000000e8,
++0x000000ab,0x00000042,0x0004003d,0x00000006,
++0x000000e9,0x000000e8,0x0004003d,0x00000009,
++0x000000af,0x00000090,0x0003003e,0x000000ae,
++0x000000af,0x000200f9,0x000000ef,0x000200f8,
++0x000000ef,0x000700f5,0x0000000f,0x0000011e,
++0x00000012,0x000000e7,0x000000f5,0x00000113,
++0x000500b1,0x0000001a,0x000000f2,0x0000011e,
++0x00000019,0x000400f6,0x00000116,0x00000113,
++0x00000000,0x000400fa,0x000000f2,0x000000f3,
++0x00000116,0x000200f8,0x000000f3,0x00050080,
++0x0000000f,0x000000f5,0x0000011e,0x0000001e,
++0x000200f9,0x000000f6,0x000200f8,0x000000f6,
++0x000700f5,0x0000000f,0x00000122,0x000000f5,
++0x000000f3,0x00000111,0x0000010f,0x000500b1,
++0x0000001a,0x000000f9,0x00000122,0x00000026,
++0x000400f6,0x00000112,0x0000010f,0x00000000,
++0x000400fa,0x000000f9,0x000000fa,0x00000112,
++0x000200f8,0x000000fa,0x00050041,0x00000029,
++0x000000fc,0x000000ae,0x00000122,0x0004003d,
++0x00000006,0x000000fd,0x000000fc,0x00050041,
++0x00000029,0x000000ff,0x000000ae,0x0000011e,
++0x0004003d,0x00000006,0x00000100,0x000000ff,
++0x000500b8,0x0000001a,0x00000101,0x000000fd,
++0x00000100,0x000300f7,0x0000010e,0x00000000,
++0x000400fa,0x00000101,0x00000102,0x0000010e,
++0x000200f8,0x00000102,0x0004003d,0x00000006,
++0x00000105,0x000000ff,0x0004003d,0x00000006,
++0x00000109,0x000000fc,0x0003003e,0x000000ff,
++0x00000109,0x0003003e,0x000000fc,0x00000105,
++0x000200f9,0x0000010e,0x000200f8,0x0000010e,
++0x000200f9,0x0000010f,0x000200f8,0x0000010f,
++0x00050080,0x0000000f,0x00000111,0x00000122,
++0x0000001e,0x000200f9,0x000000f6,0x000200f8,
++0x00000112,0x000200f9,0x00000113,0x000200f8,
++0x00000113,0x000200f9,0x000000ef,0x000200f8,
++0x00000116,0x00050041,0x00000029,0x00000117,
++0x000000ae,0x00000042,0x0004003d,0x00000006,
++0x00000118,0x00000117,0x00070050,0x00000053,
++0x000000b2,0x000000e9,0x00000118,0x00000121,
++0x00000062,0x00040063,0x000000a9,0x00000050,
++0x000000b2,0x000200f9,0x000000b5,0x000200f8,
++0x000000b5,0x000100fd,0x00010038
++};
++const uint32_t kFg_interp[] = {
++0x07230203,0x00010000,0x000d000a,0x00000099,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00060010,0x00000004,
++0x00000011,0x00000008,0x00000008,0x00000001,
++0x00040047,0x0000000d,0x0000000b,0x0000001c,
++0x00050048,0x00000016,0x00000000,0x00000023,
++0x00000000,0x00050048,0x00000016,0x00000001,
++0x00000023,0x00000010,0x00030047,0x00000016,
++0x00000002,0x00040047,0x0000003f,0x00000022,
++0x00000000,0x00040047,0x0000003f,0x00000021,
++0x00000002,0x00040047,0x00000047,0x00000022,
++0x00000000,0x00040047,0x00000047,0x00000021,
++0x00000000,0x00040047,0x00000054,0x00000022,
++0x00000000,0x00040047,0x00000054,0x00000021,
++0x00000001,0x00040047,0x00000081,0x00000022,
++0x00000000,0x00040047,0x00000081,0x00000021,
++0x00000003,0x00030047,0x00000081,0x00000019,
++0x00040047,0x00000090,0x0000000b,0x00000019,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00040017,0x00000007,0x00000006,
++0x00000002,0x00040015,0x0000000a,0x00000020,
++0x00000000,0x00040017,0x0000000b,0x0000000a,
++0x00000003,0x00040020,0x0000000c,0x00000001,
++0x0000000b,0x0004003b,0x0000000c,0x0000000d,
++0x00000001,0x00040017,0x0000000e,0x0000000a,
++0x00000002,0x00040017,0x00000013,0x00000006,
++0x00000004,0x00030016,0x00000014,0x00000020,
++0x00040017,0x00000015,0x00000014,0x00000004,
++0x0004001e,0x00000016,0x00000013,0x00000015,
++0x00040020,0x00000017,0x00000009,0x00000016,
++0x0004003b,0x00000017,0x00000018,0x00000009,
++0x0004002b,0x00000006,0x00000019,0x00000000,
++0x00040020,0x0000001a,0x00000009,0x00000013,
++0x00020014,0x0000001e,0x00040017,0x0000001f,
++0x0000001e,0x00000002,0x00040017,0x00000025,
++0x00000014,0x00000002,0x0004002b,0x00000014,
++0x0000002a,0x3f000000,0x0004002b,0x00000006,
++0x0000002f,0x00000001,0x00040020,0x00000030,
++0x00000009,0x00000015,0x0004002b,0x0000000a,
++0x00000037,0x00000002,0x00040020,0x00000038,
++0x00000009,0x00000014,0x00090019,0x0000003c,
++0x00000014,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000001,0x00000000,0x0003001b,
++0x0000003d,0x0000003c,0x00040020,0x0000003e,
++0x00000000,0x0000003d,0x0004003b,0x0000003e,
++0x0000003f,0x00000000,0x0004002b,0x00000014,
++0x00000042,0x00000000,0x0004003b,0x0000003e,
++0x00000047,0x00000000,0x0004003b,0x0000003e,
++0x00000054,0x00000000,0x0004002b,0x00000014,
++0x00000057,0x3f800000,0x00040017,0x00000073,
++0x00000014,0x00000003,0x0004002b,0x00000014,
++0x0000007b,0x3da3d70a,0x0004002b,0x00000014,
++0x0000007c,0x3e800000,0x00090019,0x0000007f,
++0x00000014,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000002,0x00040020,
++0x00000080,0x00000000,0x0000007f,0x0004003b,
++0x00000080,0x00000081,0x00000000,0x0004002b,
++0x0000000a,0x0000008e,0x00000008,0x0004002b,
++0x0000000a,0x0000008f,0x00000001,0x0006002c,
++0x0000000b,0x00000090,0x0000008e,0x0000008e,
++0x0000008f,0x0004002b,0x0000000a,0x00000093,
++0x00000000,0x0005002c,0x00000025,0x00000098,
++0x0000002a,0x0000002a,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x000300f7,0x00000091,0x00000000,
++0x000300fb,0x00000093,0x00000092,0x000200f8,
++0x00000092,0x0004003d,0x0000000b,0x0000000f,
++0x0000000d,0x0007004f,0x0000000e,0x00000010,
++0x0000000f,0x0000000f,0x00000000,0x00000001,
++0x0004007c,0x00000007,0x00000011,0x00000010,
++0x00050041,0x0000001a,0x0000001b,0x00000018,
++0x00000019,0x0004003d,0x00000013,0x0000001c,
++0x0000001b,0x0007004f,0x00000007,0x0000001d,
++0x0000001c,0x0000001c,0x00000000,0x00000001,
++0x000500af,0x0000001f,0x00000020,0x00000011,
++0x0000001d,0x0004009a,0x0000001e,0x00000021,
++0x00000020,0x000300f7,0x00000023,0x00000000,
++0x000400fa,0x00000021,0x00000022,0x00000023,
++0x000200f8,0x00000022,0x000200f9,0x00000091,
++0x000200f8,0x00000023,0x0004006f,0x00000025,
++0x00000029,0x00000011,0x00050081,0x00000025,
++0x0000002c,0x00000029,0x00000098,0x00050041,
++0x00000030,0x00000031,0x00000018,0x0000002f,
++0x0004003d,0x00000015,0x00000032,0x00000031,
++0x0007004f,0x00000025,0x00000033,0x00000032,
++0x00000032,0x00000000,0x00000001,0x00050085,
++0x00000025,0x00000034,0x0000002c,0x00000033,
++0x00060041,0x00000038,0x00000039,0x00000018,
++0x0000002f,0x00000037,0x0004003d,0x00000014,
++0x0000003a,0x00000039,0x0004003d,0x0000003d,
++0x00000040,0x0000003f,0x00070058,0x00000015,
++0x00000043,0x00000040,0x00000034,0x00000002,
++0x00000042,0x0007004f,0x00000025,0x00000044,
++0x00000043,0x00000043,0x00000000,0x00000001,
++0x0004003d,0x0000003d,0x00000048,0x00000047,
++0x0005008e,0x00000025,0x0000004c,0x00000044,
++0x0000003a,0x00050083,0x00000025,0x0000004d,
++0x0000002c,0x0000004c,0x00050085,0x00000025,
++0x00000051,0x0000004d,0x00000033,0x00070058,
++0x00000015,0x00000052,0x00000048,0x00000051,
++0x00000002,0x00000042,0x0004003d,0x0000003d,
++0x00000055,0x00000054,0x00050083,0x00000014,
++0x00000059,0x00000057,0x0000003a,0x0005008e,
++0x00000025,0x0000005b,0x00000044,0x00000059,
++0x00050081,0x00000025,0x0000005c,0x0000002c,
++0x0000005b,0x00050085,0x00000025,0x00000060,
++0x0000005c,0x00000033,0x00070058,0x00000015,
++0x00000061,0x00000055,0x00000060,0x00000002,
++0x00000042,0x00070050,0x00000015,0x00000066,
++0x0000003a,0x0000003a,0x0000003a,0x0000003a,
++0x0008000c,0x00000015,0x00000067,0x00000001,
++0x0000002e,0x00000052,0x00000061,0x00000066,
++0x00070058,0x00000015,0x0000006b,0x00000048,
++0x00000034,0x00000002,0x00000042,0x00070058,
++0x00000015,0x0000006e,0x00000055,0x00000034,
++0x00000002,0x00000042,0x0008000c,0x00000015,
++0x00000071,0x00000001,0x0000002e,0x0000006b,
++0x0000006e,0x00000066,0x0008004f,0x00000073,
++0x00000075,0x00000052,0x00000052,0x00000000,
++0x00000001,0x00000002,0x0008004f,0x00000073,
++0x00000077,0x00000061,0x00000061,0x00000000,
++0x00000001,0x00000002,0x00050083,0x00000073,
++0x00000078,0x00000075,0x00000077,0x0006000c,
++0x00000014,0x00000079,0x00000001,0x00000042,
++0x00000078,0x0008000c,0x00000014,0x0000007e,
++0x00000001,0x00000031,0x0000007b,0x0000007c,
++0x00000079,0x0004003d,0x0000007f,0x00000082,
++0x00000081,0x00070050,0x00000015,0x00000087,
++0x0000007e,0x0000007e,0x0000007e,0x0000007e,
++0x0008000c,0x00000015,0x00000088,0x00000001,
++0x0000002e,0x00000067,0x00000071,0x00000087,
++0x00050051,0x00000014,0x0000008a,0x00000088,
++0x00000000,0x00050051,0x00000014,0x0000008b,
++0x00000088,0x00000001,0x00050051,0x00000014,
++0x0000008c,0x00000088,0x00000002,0x00070050,
++0x00000015,0x0000008d,0x0000008a,0x0000008b,
++0x0000008c,0x00000057,0x00040063,0x00000082,
++0x00000011,0x0000008d,0x000200f9,0x00000091,
++0x000200f8,0x00000091,0x000100fd,0x00010038
++};
++const uint32_t kFg_copy[] = {
++0x07230203,0x00010000,0x000d000a,0x0000004f,
++0x00000000,0x00020011,0x00000001,0x0006000b,
++0x00000001,0x4c534c47,0x6474732e,0x3035342e,
++0x00000000,0x0003000e,0x00000000,0x00000001,
++0x0006000f,0x00000005,0x00000004,0x6e69616d,
++0x00000000,0x0000000d,0x00060010,0x00000004,
++0x00000011,0x00000008,0x00000008,0x00000001,
++0x00040047,0x0000000d,0x0000000b,0x0000001c,
++0x00050048,0x00000016,0x00000000,0x00000023,
++0x00000000,0x00050048,0x00000016,0x00000001,
++0x00000023,0x00000010,0x00030047,0x00000016,
++0x00000002,0x00040047,0x00000027,0x00000022,
++0x00000000,0x00040047,0x00000027,0x00000021,
++0x00000003,0x00030047,0x00000027,0x00000019,
++0x00040047,0x0000002d,0x00000022,0x00000000,
++0x00040047,0x0000002d,0x00000021,0x00000000,
++0x00040047,0x00000046,0x0000000b,0x00000019,
++0x00020013,0x00000002,0x00030021,0x00000003,
++0x00000002,0x00040015,0x00000006,0x00000020,
++0x00000001,0x00040017,0x00000007,0x00000006,
++0x00000002,0x00040015,0x0000000a,0x00000020,
++0x00000000,0x00040017,0x0000000b,0x0000000a,
++0x00000003,0x00040020,0x0000000c,0x00000001,
++0x0000000b,0x0004003b,0x0000000c,0x0000000d,
++0x00000001,0x00040017,0x0000000e,0x0000000a,
++0x00000002,0x00040017,0x00000013,0x00000006,
++0x00000004,0x00030016,0x00000014,0x00000020,
++0x00040017,0x00000015,0x00000014,0x00000004,
++0x0004001e,0x00000016,0x00000013,0x00000015,
++0x00040020,0x00000017,0x00000009,0x00000016,
++0x0004003b,0x00000017,0x00000018,0x00000009,
++0x0004002b,0x00000006,0x00000019,0x00000000,
++0x00040020,0x0000001a,0x00000009,0x00000013,
++0x00020014,0x0000001e,0x00040017,0x0000001f,
++0x0000001e,0x00000002,0x00090019,0x00000025,
++0x00000014,0x00000001,0x00000000,0x00000000,
++0x00000000,0x00000002,0x00000002,0x00040020,
++0x00000026,0x00000000,0x00000025,0x0004003b,
++0x00000026,0x00000027,0x00000000,0x00090019,
++0x0000002a,0x00000014,0x00000001,0x00000000,
++0x00000000,0x00000000,0x00000001,0x00000000,
++0x0003001b,0x0000002b,0x0000002a,0x00040020,
++0x0000002c,0x00000000,0x0000002b,0x0004003b,
++0x0000002c,0x0000002d,0x00000000,0x00040017,
++0x00000030,0x00000014,0x00000002,0x0004002b,
++0x00000014,0x00000032,0x3f000000,0x0004002b,
++0x00000006,0x00000035,0x00000001,0x00040020,
++0x00000036,0x00000009,0x00000015,0x0004002b,
++0x00000014,0x0000003b,0x00000000,0x0004002b,
++0x00000014,0x0000003f,0x3f800000,0x0004002b,
++0x0000000a,0x00000044,0x00000008,0x0004002b,
++0x0000000a,0x00000045,0x00000001,0x0006002c,
++0x0000000b,0x00000046,0x00000044,0x00000044,
++0x00000045,0x0004002b,0x0000000a,0x00000049,
++0x00000000,0x0005002c,0x00000030,0x0000004e,
++0x00000032,0x00000032,0x00050036,0x00000002,
++0x00000004,0x00000000,0x00000003,0x000200f8,
++0x00000005,0x000300f7,0x00000047,0x00000000,
++0x000300fb,0x00000049,0x00000048,0x000200f8,
++0x00000048,0x0004003d,0x0000000b,0x0000000f,
++0x0000000d,0x0007004f,0x0000000e,0x00000010,
++0x0000000f,0x0000000f,0x00000000,0x00000001,
++0x0004007c,0x00000007,0x00000011,0x00000010,
++0x00050041,0x0000001a,0x0000001b,0x00000018,
++0x00000019,0x0004003d,0x00000013,0x0000001c,
++0x0000001b,0x0007004f,0x00000007,0x0000001d,
++0x0000001c,0x0000001c,0x00000000,0x00000001,
++0x000500af,0x0000001f,0x00000020,0x00000011,
++0x0000001d,0x0004009a,0x0000001e,0x00000021,
++0x00000020,0x000300f7,0x00000023,0x00000000,
++0x000400fa,0x00000021,0x00000022,0x00000023,
++0x000200f8,0x00000022,0x000200f9,0x00000047,
++0x000200f8,0x00000023,0x0004003d,0x00000025,
++0x00000028,0x00000027,0x0004003d,0x0000002b,
++0x0000002e,0x0000002d,0x0004006f,0x00000030,
++0x00000031,0x00000011,0x00050081,0x00000030,
++0x00000034,0x00000031,0x0000004e,0x00050041,
++0x00000036,0x00000037,0x00000018,0x00000035,
++0x0004003d,0x00000015,0x00000038,0x00000037,
++0x0007004f,0x00000030,0x00000039,0x00000038,
++0x00000038,0x00000000,0x00000001,0x00050085,
++0x00000030,0x0000003a,0x00000034,0x00000039,
++0x00070058,0x00000015,0x0000003c,0x0000002e,
++0x0000003a,0x00000002,0x0000003b,0x00050051,
++0x00000014,0x00000040,0x0000003c,0x00000000,
++0x00050051,0x00000014,0x00000041,0x0000003c,
++0x00000001,0x00050051,0x00000014,0x00000042,
++0x0000003c,0x00000002,0x00070050,0x00000015,
++0x00000043,0x00000040,0x00000041,0x00000042,
++0x0000003f,0x00040063,0x00000028,0x00000011,
++0x00000043,0x000200f9,0x00000047,0x000200f8,
++0x00000047,0x000100fd,0x00010038
++};
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index a3e0450..aee96ec 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1488,8 +1488,10 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+   image_create_info.arrayLayers = 1;
+   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+-  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++  // Transfer destination: frame generation copies its finished frames in.
++  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                            VK_IMAGE_USAGE_STORAGE_BIT;
+   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   image_create_info.queueFamilyIndexCount = 0;
+   image_create_info.pQueueFamilyIndices = nullptr;
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index b5174ff..f705251 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -42,6 +42,14 @@
+ #include <rex/ui/surface_android.h>
+ #endif
+ 
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++REXCVAR_DEFINE_DOUBLE(android_display_refresh_hz, 0.0, "Android",
++                      "Display refresh rate to request for the game surface (0 = leave it; 120 for "
++                      "frame generation x4 on a 120 Hz panel)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ namespace rex::ui {
+ 
+ namespace {
+@@ -414,6 +422,19 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+     auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+         props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+     if (native_window) {
++      // Ask for a display refresh rate (e.g. 120 Hz for frame generation x4). API 31, so resolved
++      // at run time.
++      const double refresh_hz = REXCVAR_GET(android_display_refresh_hz);
++      if (refresh_hz > 0.0) {
++        using SetFrameRateFn = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
++        static auto set_frame_rate = reinterpret_cast<SetFrameRateFn>(
++            dlsym(dlopen("libandroid.so", RTLD_NOW), "ANativeWindow_setFrameRateWithChangeStrategy"));
++        if (set_frame_rate) {
++          // FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1, CHANGE_FRAME_RATE_ALWAYS = 1.
++          const int32_t result = set_frame_rate(native_window, float(refresh_hz), 1, 1);
++          REXLOG_INFO("Android: requested a {} Hz display refresh: {}", refresh_hz, result);
++        }
++      }
+       return std::make_unique<AndroidNativeWindowSurface>(native_window);
+     }
+   }

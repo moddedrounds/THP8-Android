@@ -593,13 +593,20 @@ REXCVAR_DEFINE_COMMAND_ARGS(
     cheat_zone,
     ([](std::string_view args) {
       std::string zone = thps::cheats::CleanArgument(args);
-      if (zone != "funpark" && zone != "Funpark") {
-        REXLOG_WARN("[cheat] usage: cheat_zone funpark");
+      for (char& c : zone) {
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+      }
+      // Zone packs in DATA/COMPRESSED/ZONES: z_<name>.pak.xen (houses = Suburbia, ghetto = the
+      // slums, center, citypark, cretepark, factory, funpark, inschool, outschool, parking, shops,
+      // training, ...). Any of them loads through the same Free Skate path as load_z_houses.
+      if (zone.empty() || zone.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") !=
+                              std::string::npos) {
+        REXLOG_WARN("[cheat] usage: cheat_zone <zone> (e.g. funpark, factory, ghetto, shops)");
         return;
       }
-      thps::guest_call::Post([]() {
+      thps::guest_call::Post([zone]() {
         constexpr uint32_t kLevel = 0x651533EC;
-        constexpr uint32_t kLoadFunpark = 0x2349A9C0;
+        const uint32_t kLoadFunpark = thps::probe::Checksum("load_z_" + zone);
         constexpr uint32_t kNotFromLevelSelectMenu = 0x856E853E;
         // The shipped Free Skate READY handler calls level_select_change_level
         // with level=load_z_houses and not_from_levelselect_menu. Reproduce
@@ -620,12 +627,12 @@ REXCVAR_DEFINE_COMMAND_ARGS(
           thps::cheats::detail::state().zone_changes.fetch_add(
               1, std::memory_order_relaxed);
         }
-        REXLOG_INFO("[cheat] level_select_change_level(load_z_funpark) "
-                    "returned {:08X}", result);
+        REXLOG_INFO("[cheat] level_select_change_level(load_z_{}) "
+                    "returned {:08X}", zone, result);
       });
     }),
-    "Cheats", "cheat_zone funpark - load Funpark through the retail Free Skate "
-              "level-selection path");
+    "Cheats", "cheat_zone <zone> - load a zone (funpark, factory, ghetto, ...) through "
+              "the retail Free Skate level-selection path");
 
 REXCVAR_DEFINE_COMMAND_ARGS(
     cheat_warp,

@@ -1,0 +1,75 @@
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index e3fc40d..fc4cca0 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -31,6 +31,12 @@ class DynamicLibrary {
+   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
+ 
+   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
++  // Takes over a handle opened elsewhere (the app's custom-driver loader). Never dlclose'd.
++  void AdoptLeakedHandle(void* handle) {
++    Close();
++    handle_ = handle;
++    leaked_ = true;
++  }
+   void Close();
+   explicit operator bool() const { return handle_ != nullptr; }
+ 
+@@ -43,6 +49,7 @@ class DynamicLibrary {
+ 
+  private:
+   void* handle_ = nullptr;
++  bool leaked_ = false;
+ };
+ 
+ namespace lib_names {
+diff --git a/src/core/dynlib_posix.cpp b/src/core/dynlib_posix.cpp
+index fcfd6c9..e50aef0 100644
+--- a/src/core/dynlib_posix.cpp
++++ b/src/core/dynlib_posix.cpp
+@@ -33,7 +33,10 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mo
+ 
+ void DynamicLibrary::Close() {
+   if (handle_) {
+-    dlclose(handle_);
++    if (!leaked_) {
++      dlclose(handle_);
++    }
++    leaked_ = false;
+     handle_ = nullptr;
+   }
+ }
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..51be616 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <sstream>
+ #include <string>
+ #include <unordered_map>
+@@ -75,7 +76,20 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+     return nullptr;
+   }
+ #else
+-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
++#if REX_PLATFORM_ANDROID
++  // A custom driver loader in the app (adrenotools) can hand over its own libvulkan instance.
++  if (const char* handle_text = std::getenv("REX_VULKAN_LOADER_HANDLE")) {
++    const uintptr_t handle_value = uintptr_t(std::strtoull(handle_text, nullptr, 0));
++    if (handle_value) {
++      vulkan_instance->loader_.AdoptLeakedHandle(reinterpret_cast<void*>(handle_value));
++      loader_loaded = true;
++      REXLOG_INFO("Using the app-provided Vulkan loader handle {}", handle_text);
++    }
++  }
++#endif
++  if (!loader_loaded) {
++    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
++  }
+   if (!loader_loaded) {
+     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
+     return nullptr;

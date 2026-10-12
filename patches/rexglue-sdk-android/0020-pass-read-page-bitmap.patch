@@ -1,0 +1,104 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 4c30c76..63d0c26 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -930,9 +930,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t render_pass_serial_ = 0;
+   // See render_pass_begin_position().
+   size_t render_pass_begin_position_ = SIZE_MAX;
+-  // Shared memory ranges (start, length in bytes) the draws of the current pass have read. Too many
+-  // of them stop hoisting for the pass (the flag) instead of growing without bound.
+-  std::vector<std::pair<uint32_t, uint32_t>> pass_shared_memory_reads_;
++  // 4 KB pages of shared memory the draws of the current pass have read: one bit per page, and the
++  // indices of the non-zero words (cleared when the next pass begins). Exact for page-granular
++  // uploads, constant time per page, and no overflow (a range list used to be scanned per upload).
++  void ClearPassSharedMemoryReads();
++  std::vector<uint64_t> pass_read_page_bits_;
++  std::vector<uint32_t> pass_read_page_words_;
+   bool pass_shared_memory_reads_overflow_ = false;
+   std::unordered_set<VkImage> pass_sampled_images_;
+   bool texture_hoist_active_ = false;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 37bd30e..1344d93 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3676,7 +3676,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   // We are outside any pass here, and the begin command is written next: this is where uploads
+   // that the pass has not read can be recorded later (see render_pass_begin_position()).
+   render_pass_begin_position_ = deferred_command_buffer_.Position();
+-  pass_shared_memory_reads_.clear();
++  ClearPassSharedMemoryReads();
+   pass_sampled_images_.clear();
+   pass_shared_memory_reads_overflow_ = false;
+ 
+@@ -3762,7 +3762,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   // We are outside any pass here, and the begin command is written next: this is where uploads
+   // that the pass has not read can be recorded later (see render_pass_begin_position()).
+   render_pass_begin_position_ = deferred_command_buffer_.Position();
+-  pass_shared_memory_reads_.clear();
++  ClearPassSharedMemoryReads();
+   pass_sampled_images_.clear();
+   pass_shared_memory_reads_overflow_ = false;
+ 
+@@ -4134,29 +4134,49 @@ void VulkanCommandProcessor::ForceHostMsaaOff() {
+   (*register_file_)[XE_GPU_REG_RB_SURFACE_INFO] &= ~(uint32_t(3) << 16);
+ }
+ 
++void VulkanCommandProcessor::ClearPassSharedMemoryReads() {
++  for (uint32_t word : pass_read_page_words_) {
++    pass_read_page_bits_[word] = 0;
++  }
++  pass_read_page_words_.clear();
++}
++
+ void VulkanCommandProcessor::NoteSharedMemoryRead(uint32_t start, uint32_t length) {
+   if (!in_render_pass_ || !length || pass_shared_memory_reads_overflow_) {
+     return;
+   }
+-  // Draws request a handful of ranges each; a pass of hundreds of draws is rare, and a pass that
+-  // needs more than this simply keeps the old behaviour (uploads end the pass).
+-  constexpr size_t kMaxTrackedReads = 4096;
+-  if (pass_shared_memory_reads_.size() >= kMaxTrackedReads) {
+-    pass_shared_memory_reads_overflow_ = true;
+-    return;
++  if (pass_read_page_bits_.empty()) {
++    pass_read_page_bits_.resize((SharedMemory::kBufferSize >> 12) / 64);
++  }
++  const uint32_t page_first = start >> 12;
++  const uint32_t page_last =
++      std::min(uint32_t((uint64_t(start) + length - 1) >> 12),
++               uint32_t(pass_read_page_bits_.size() * 64 - 1));
++  for (uint32_t word = page_first >> 6; word <= (page_last >> 6); ++word) {
++    uint64_t bits = ~uint64_t(0);
++    if (word == (page_first >> 6)) bits &= ~uint64_t(0) << (page_first & 63);
++    if (word == (page_last >> 6)) bits &= ~uint64_t(0) >> (63 - (page_last & 63));
++    if (!pass_read_page_bits_[word]) pass_read_page_words_.push_back(word);
++    pass_read_page_bits_[word] |= bits;
+   }
+-  pass_shared_memory_reads_.emplace_back(start, length);
+ }
+ 
+ bool VulkanCommandProcessor::SharedMemoryReadInCurrentPass(uint32_t start, uint32_t length) const {
+   if (pass_shared_memory_reads_overflow_) {
+     return true;  // Unknown: assume the worst.
+   }
+-  const uint64_t end = uint64_t(start) + length;
+-  for (const auto& read : pass_shared_memory_reads_) {
+-    if (uint64_t(read.first) < end && uint64_t(read.first) + read.second > start) {
+-      return true;
+-    }
++  if (!length || pass_read_page_words_.empty()) {
++    return false;
++  }
++  const uint32_t page_first = start >> 12;
++  const uint32_t page_last =
++      std::min(uint32_t((uint64_t(start) + length - 1) >> 12),
++               uint32_t(pass_read_page_bits_.size() * 64 - 1));
++  for (uint32_t word = page_first >> 6; word <= (page_last >> 6); ++word) {
++    uint64_t bits = ~uint64_t(0);
++    if (word == (page_first >> 6)) bits &= ~uint64_t(0) << (page_first & 63);
++    if (word == (page_last >> 6)) bits &= ~uint64_t(0) >> (63 - (page_last & 63));
++    if (pass_read_page_bits_[word] & bits) return true;
+   }
+   return false;
+ }

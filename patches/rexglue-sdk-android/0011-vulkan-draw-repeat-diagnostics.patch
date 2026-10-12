@@ -1,0 +1,61 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1f19076..5a349d5 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4248,7 +4248,12 @@ void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
+   }
+ }
+ 
+-void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
++void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor_in) {
++  VkRect2D scissor = scissor_in;
++  if (LiveDiagnosticFlags() & 128u) {
++    scissor.extent.width = std::max<uint32_t>(1, scissor.extent.width / 2);
++    scissor.extent.height = std::max<uint32_t>(1, scissor.extent.height / 2);
++  }
+   if (!dynamic_scissor_update_needed_) {
+     dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.x != scissor.offset.x;
+     dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.y != scissor.offset.y;
+@@ -5151,6 +5156,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++    if (LiveDiagnosticFlags() & (32u | 64u)) {
++      // 32: two extra identical draws. 64: the same, but with a 1x1 scissor (no fragments).
++      const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
++      if (tiny) {
++        const VkRect2D tiny_scissor = {{0, 0}, {1, 1}};
++        deferred_command_buffer_.CmdVkSetScissor(0, 1, &tiny_scissor);
++      }
++      for (int rep_i = 0; rep_i < 2; ++rep_i) {
++        deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0,
++                                           0);
++      }
++      if (tiny) {
++        deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
++      }
++    }
+     if (LiveDiagnosticFlags() & 4u) {
+       DrawOutputStats& out = DrawOutputs();
+       ++out.total;
+@@ -5210,6 +5230,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+                                               0, 0, 0);
++    if (LiveDiagnosticFlags() & (32u | 64u)) {
++      const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
++      if (tiny) {
++        const VkRect2D tiny_scissor = {{0, 0}, {1, 1}};
++        deferred_command_buffer_.CmdVkSetScissor(0, 1, &tiny_scissor);
++      }
++      for (int rep_i = 0; rep_i < 2; ++rep_i) {
++        deferred_command_buffer_.CmdVkDrawIndexed(
++            primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++      }
++      if (tiny) {
++        deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
++      }
++    }
+     if (LiveDiagnosticFlags() & 4u) {
+       DrawOutputStats& out = DrawOutputs();
+       ++out.total;

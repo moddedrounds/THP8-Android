@@ -1,0 +1,128 @@
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..c2b13e4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,7 +11,12 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -25,6 +30,12 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_force_stereo, false, "Audio",
++                    "Always open a stereo output and fold the guest 5.1 mix into it (center and "
++                    "surrounds included) instead of handing a 6-channel stream to the OS");
++REXCVAR_DEFINE_STRING(audio_dump_path, "", "Audio",
++                      "Append every submitted guest audio frame (6 planar big-endian float "
++                      "channels x 256 samples, 48 kHz) to this file - for diagnosing missing audio");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -75,7 +86,7 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
+-  if (obtained_spec.channels <= 2) {
++  if (obtained_spec.channels <= 2 || REXCVAR_GET(audio_force_stereo)) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
+@@ -124,6 +135,29 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
+ 
++  if (!REXCVAR_GET(audio_dump_path).empty()) {
++    // One file per driver (= per guest render client): <path>.<n>
++    static std::mutex dump_mutex;
++    static std::vector<std::pair<SDLAudioDriver*, FILE*>> dumps;
++    FILE* dump = nullptr;
++    {
++      std::lock_guard<std::mutex> lock(dump_mutex);
++      for (auto& [d, f] : dumps)
++        if (d == this) dump = f;
++      if (!dump) {
++        auto path = REXCVAR_GET(audio_dump_path) + "." + std::to_string(dumps.size());
++        dump = std::fopen(path.c_str(), "wb");
++        dumps.emplace_back(this, dump);
++        REXAPU_INFO("audio dump: driver {} -> {}", static_cast<void*>(this), path);
++      }
++    }
++    if (dump) {
++      std::fwrite(output_frame, sizeof(float), frame_samples_, dump);
++      static uint32_t dump_frames = 0;
++      if ((++dump_frames & 255) == 0) std::fflush(dump);
++    }
++  }
++
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+     REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+index 86e7888..e372fb9 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+@@ -17,15 +17,21 @@
+ #include <rex/logging.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
++#include <rex/cvar.h>
+ #include <rex/runtime.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++REXCVAR_DEFINE_UINT32(audio_speaker_config, 0x00010001, "Audio",
++                      "Value XAudioGetSpeakerConfig reports to the game (low word = analog "
++                      "output mode, high word = digital output mode)");
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
+-  *config_ptr = 0x00010001;
++  *config_ptr = static_cast<uint32_t>(REXCVAR_GET(audio_speaker_config));
++  REXKRNL_INFO("XAudioGetSpeakerConfig -> {:08X}", static_cast<uint32_t>(*config_ptr));
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -52,7 +58,7 @@ u32 XAudioEnableDucker_entry(u32 unk) {
+ }
+ 
+ u32 XAudioRegisterRenderDriverClient_entry(mapped_u32 callback_ptr, mapped_u32 driver_ptr) {
+-  REXKRNL_DEBUG("XAudioRegisterRenderDriverClient called! callback_ptr={:08X} driver_ptr={:08X}",
++  REXKRNL_INFO("XAudioRegisterRenderDriverClient called! callback_ptr={:08X} driver_ptr={:08X}",
+                 callback_ptr.guest_address(), driver_ptr.guest_address());
+   if (!callback_ptr) {
+     return X_E_INVALIDARG;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_xconfig.cpp b/src/kernel/xboxkrnl/xboxkrnl_xconfig.cpp
+index f4ad126..293de72 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_xconfig.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_xconfig.cpp
+@@ -22,6 +22,8 @@
+ #include <rex/system/user_module.h>
+ #include <rex/system/xtypes.h>
+ 
++REXCVAR_DECLARE(uint32_t, audio_speaker_config);
++
+ namespace rex::kernel::xboxkrnl {
+ 
+ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
+@@ -69,7 +71,8 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
+           break;
+         case 0x000B:  // XCONFIG_USER_AUDIO_FLAGS
+           setting_size = 4;
+-          memory::store_and_swap<uint32_t>(value, 0x00010001);
++          memory::store_and_swap<uint32_t>(value, REXCVAR_GET(audio_speaker_config));
++          REXKRNL_INFO("XConfig USER_AUDIO_FLAGS -> {:08X}", REXCVAR_GET(audio_speaker_config));
+           break;
+         case 0x000C:  // XCONFIG_USER_RETAIL_FLAGS
+           setting_size = 4;

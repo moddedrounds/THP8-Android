@@ -1,0 +1,652 @@
+diff --git a/include/rex/graphics/pipeline/shader/spirv_builder.h b/include/rex/graphics/pipeline/shader/spirv_builder.h
+index dbd6b01..ad38cb7 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_builder.h
++++ b/include/rex/graphics/pipeline/shader/spirv_builder.h
+@@ -34,6 +34,8 @@ class SpirvBuilder : public spv::Builder {
+   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
+                        spv::Id operand3, spv::Id operand4);
+ 
++  // With contraction allowed, the createNoContraction* functions don't add NoContraction.
++  void setContractionAllowed(bool allowed) { contraction_allowed_ = allowed; }
+   spv::Id createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id, spv::Id operand);
+   spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
+                                    spv::Id operand2);
+@@ -141,6 +143,9 @@ class SpirvBuilder : public spv::Builder {
+ 
+     Branch current_branch_ = Branch::kSelection;
+   };
++
++ private:
++  bool contraction_allowed_ = false;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dede7b2..8132d60 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -72,6 +72,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       uint32_t tessellation_mode : 2;
+       // Shader::native_vertex_fetch_layout() attributes read from vertex inputs (kVertex only).
+       uint32_t native_vertex_fetch : 1;
++      // IEEE multiplication by zero (gpu_ieee_vertex_shader_mul): 0 * inf / NaN not forced to 0.
++      // Results for finite values are unchanged (NoContraction is kept).
++      uint32_t ieee_mul : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -90,6 +93,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       uint32_t param_gen_point : 1;
+       // For host render targets - depth / stencil output mode.
+       DepthStencilMode depth_stencil_mode : 3;
++      // Faster, not bit-exact pixel shader math (gpu_fast_pixel_shader_math): multiply-add may be
++      // fused, and multiplication by zero follows IEEE rules (0 * inf / NaN is not forced to 0).
++      uint32_t fast_math : 1;
++      // Texture fetches with computed LOD sample with implicit LOD + bias instead of explicit
++      // gradients scaled by 2^bias (same result; avoids the slow gradient sample instructions).
++      uint32_t implicit_lod : 1;
++      // Diagnostic (live flag 33554432): texture samples replaced by a value derived from the
++      // coordinates (timing only, wrong output).
++      uint32_t diag_no_texture_sample : 1;
++      // Static texture signs (gpu_static_texture_signs), 2 bits for each of the first 5 distinct
++      // fetch constants in texture_bindings() order: 0 = read from the system constants,
++      // 1 = all components unsigned, 2 = all gamma, 3 = XYZ gamma and W unsigned.
++      uint32_t texture_sign_classes : 10;
++      // All fetch constants used have a zero result exponent bias.
++      uint32_t texture_exp_bias_zero : 1;
+     } pixel;
+     uint64_t value = 0;
+ 
+@@ -747,6 +765,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       spv::Id equation, spv::Id source_factor, spv::Id dest_factor);
+ 
+   Features features_;
++  // Pixel shader translated with Modification::pixel.fast_math.
++  bool fast_math_ = false;
++  // IEEE multiplication (pixel fast_math or vertex ieee_mul).
++  bool ieee_mul_ = false;
++  // Pixel shader translated with Modification::pixel.implicit_lod.
++  bool implicit_lod_ = false;
++  bool diag_no_texture_sample_ = false;
++  // Modification::pixel.texture_sign_classes class of a fetch constant (0 if dynamic).
++  uint32_t GetStaticTextureSignClass(uint32_t fetch_constant_index) const;
++  // While translating a computed-LOD texture fetch with implicit_lod_: its LOD bias, used by
++  // SampleTexture in place of the gradients.
++  spv::Id implicit_lod_bias_ = spv::NoResult;
+   bool native_2x_msaa_with_attachments_;
+   bool native_2x_msaa_no_attachments_;
+ 
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index e12bc76..8dbd2f1 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -41,6 +41,9 @@
+ 
+ namespace rex::graphics::vulkan {
+ 
++// Live diagnostic shader variant for new pipeline descriptions (see PipelineDescription).
++extern std::atomic<uint32_t> g_pipeline_diag_variant;
++
+ class VulkanCommandProcessor;
+ 
+ // TODO(Triang3l): Create a common base for both the Vulkan and the Direct3D
+@@ -98,6 +101,10 @@ class VulkanPipelineCache {
+   uint64_t last_pipeline_description_hash() const {
+     return last_pipeline_ ? last_pipeline_->first.GetHash() : 0;
+   }
++  // Live diagnostic: the last configured pipeline is a null-vertex-shader variant (no bindings used).
++  bool last_pipeline_is_diag_null() const {
++    return last_pipeline_ && (last_pipeline_->first.diag_variant & 2);
++  }
+   bool IsCreatingPipelines() const;
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+                                     const PipelineLayoutProvider*& pipeline_layout_out,
+@@ -201,6 +208,9 @@ class VulkanPipelineCache {
+     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
+     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
+     uint32_t sample_rate_shading : 1;                    // 10
++    // Live diagnostic (live flags 65536 / 131072): 1 = trivial pixel shader, 2 = null vertex shader
++    // (+ trivial pixel shader). 0 for real pipelines, so their bytes and hashes are unchanged.
++    uint32_t diag_variant : 2;                           // 12
+ 
+     // Filled only for the attachments present in the render pass object.
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+diff --git a/src/graphics/pipeline/shader/spirv_builder.cpp b/src/graphics/pipeline/shader/spirv_builder.cpp
+index fe0aa4e..9dfaa94 100644
+--- a/src/graphics/pipeline/shader/spirv_builder.cpp
++++ b/src/graphics/pipeline/shader/spirv_builder.cpp
+@@ -42,14 +42,18 @@ spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id ope
+ spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id,
+                                                  spv::Id operand) {
+   spv::Id result = createUnaryOp(op_code, type_id, operand);
+-  addDecoration(result, spv::DecorationNoContraction);
++  if (!contraction_allowed_) {
++    addDecoration(result, spv::DecorationNoContraction);
++  }
+   return result;
+ }
+ 
+ spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
+                                                spv::Id operand2) {
+   spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
+-  addDecoration(result, spv::DecorationNoContraction);
++  if (!contraction_allowed_) {
++    addDecoration(result, spv::DecorationNoContraction);
++  }
+   return result;
+ }
+ 
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 198311a..109971d 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -171,12 +171,42 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
+                             : modification.pixel.dynamic_addressable_register_count;
+ }
+ 
++uint32_t SpirvShaderTranslator::GetStaticTextureSignClass(uint32_t fetch_constant_index) const {
++  if (!is_pixel_shader()) {
++    return 0;
++  }
++  const uint32_t classes = GetSpirvShaderModification().pixel.texture_sign_classes;
++  if (!classes) {
++    return 0;
++  }
++  uint32_t seen = 0, ordinal = 0;
++  for (const Shader::TextureBinding& binding : current_shader().texture_bindings()) {
++    const uint32_t bit = UINT32_C(1) << binding.fetch_constant;
++    if (seen & bit) {
++      continue;
++    }
++    seen |= bit;
++    if (binding.fetch_constant == fetch_constant_index) {
++      return ordinal < 5 ? (classes >> (2 * ordinal)) & 3 : 0;
++    }
++    ++ordinal;
++  }
++  return 0;
++}
++
+ void SpirvShaderTranslator::StartTranslation() {
+   input_native_vertex_attributes_.clear();
+   native_vertex_fetch_index_ = 0;
+   // TODO(Triang3l): Logger.
+   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
+                                             nullptr);
++  fast_math_ = is_pixel_shader() && GetSpirvShaderModification().pixel.fast_math;
++  builder_->setContractionAllowed(fast_math_);
++  ieee_mul_ = fast_math_ || (!is_pixel_shader() && GetSpirvShaderModification().vertex.ieee_mul);
++  implicit_lod_ = is_pixel_shader() && GetSpirvShaderModification().pixel.implicit_lod;
++  implicit_lod_bias_ = spv::NoResult;
++  diag_no_texture_sample_ =
++      is_pixel_shader() && GetSpirvShaderModification().pixel.diag_no_texture_sample;
+ 
+   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
+                                                   : spv::CapabilityShader);
+diff --git a/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+index 706ac7e..08c7edf 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_alu.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+@@ -24,6 +24,10 @@ namespace rex::graphics {
+ 
+ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
+                                                       spv::Id operand_1_abs) {
++  if (ieee_mul_) {
++    // IEEE multiplication (the abs operands become dead code).
++    return value;
++  }
+   EnsureBuildPointAvailable();
+   int num_components = builder_->getNumComponents(value);
+   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 3ccf392..0473d5e 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -1406,18 +1406,32 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         spv::Id const_uint_2 = builder_->makeUintConstant(2);
+         spv::Id const_uint_sign_signed =
+             builder_->makeUintConstant(uint32_t(xenos::TextureSign::kSigned));
++        // Signs known when the pipeline was created: constants (the branches and switches on
++        // them are folded by the driver's compiler).
++        const uint32_t static_sign_class = GetStaticTextureSignClass(fetch_constant_index);
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+           uint32_t result_component_index;
+           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
+             result_remaining_components &= ~(UINT32_C(1) << result_component_index);
+-            spv::Id result_component_sign = builder_->createTriOp(
+-                spv::OpBitFieldUExtract, type_uint_, swizzled_signs_word,
+-                builder_->makeUintConstant(swizzled_signs_word_offset + 2 * result_component_index),
+-                const_uint_2);
++            spv::Id result_component_sign;
++            spv::Id is_component_signed;
++            if (static_sign_class) {
++              const bool gamma = static_sign_class == 2 ||
++                                 (static_sign_class == 3 && result_component_index != 3);
++              result_component_sign = builder_->makeUintConstant(
++                  uint32_t(gamma ? xenos::TextureSign::kGamma : xenos::TextureSign::kUnsigned));
++              is_component_signed = builder_->makeBoolConstant(false);
++            } else {
++              result_component_sign = builder_->createTriOp(
++                  spv::OpBitFieldUExtract, type_uint_, swizzled_signs_word,
++                  builder_->makeUintConstant(swizzled_signs_word_offset +
++                                             2 * result_component_index),
++                  const_uint_2);
++              is_component_signed = builder_->createBinOp(
++                  spv::OpIEqual, type_bool_, result_component_sign, const_uint_sign_signed);
++            }
+             swizzled_signs[result_component_index] = result_component_sign;
+-            spv::Id is_component_signed = builder_->createBinOp(
+-                spv::OpIEqual, type_bool_, result_component_sign, const_uint_sign_signed);
+             result_is_signed[result_component_index] = is_component_signed;
+             if (is_all_signed != spv::NoResult) {
+               is_all_signed = builder_->createBinOp(spv::OpLogicalAnd, type_bool_, is_all_signed,
+@@ -1644,6 +1658,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         // Sample the texture.
+         spv::ImageOperandsMask image_operands_mask =
+             use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
++        if (implicit_lod_ && use_computed_lod && !instr.attributes.use_register_gradients) {
++          implicit_lod_bias_ = lod;
++        }
+         spv::Id sample_result_unsigned, sample_result_signed;
+         if (!use_computed_lod) {
+           texture_parameters.lod = lod;
+@@ -1880,6 +1897,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+                         sample_result_unsigned, sample_result_signed);
+         }
+ 
++        implicit_lod_bias_ = spv::NoResult;
++
+         // Swizzle the result components manually if needed, to `result`.
+         // Because the same host format component may be replicated into
+         // multiple guest components (such as for formats with less than 4
+@@ -2059,7 +2078,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+ 
+         // Apply the exponent bias from the bits 13:18 of the fetch constant
+         // word 4.
+-        spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
++        spv::Id result_exponent_bias =
++            (is_pixel_shader() && GetSpirvShaderModification().pixel.texture_exp_bias_zero)
++                ? const_float_1_
++                : builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+             builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+@@ -2222,9 +2244,25 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
+       texture_parameters.sampler = builder_->createBinOp(
+           spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image)), image,
+           sampler);
+-      sign_result =
+-          builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false, false,
+-                                      false, texture_parameters, image_operands_mask);
++      if (diag_no_texture_sample_) {
++        spv::Id c = builder_->createCompositeExtract(texture_parameters.coords, type_float_, 0);
++        id_vector_temp_.clear();
++        id_vector_temp_.insert(id_vector_temp_.end(), 4, c);
++        sign_result = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
++      } else if (implicit_lod_bias_ != spv::NoResult && texture_parameters.gradX != spv::NoResult) {
++        // Implicit LOD + bias: equivalent to the gradients scaled by 2^bias.
++        spv::Builder::TextureParameters implicit_parameters = texture_parameters;
++        implicit_parameters.gradX = spv::NoResult;
++        implicit_parameters.gradY = spv::NoResult;
++        implicit_parameters.bias = implicit_lod_bias_;
++        sign_result = builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false,
++                                                  false, false, false, implicit_parameters,
++                                                  spv::ImageOperandsMaskNone);
++      } else {
++        sign_result =
++            builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false,
++                                        false, false, texture_parameters, image_operands_mask);
++      }
+       if (lerp_factor != spv::NoResult) {
+         spv::Id lerp_first = i ? lerp_first_signed : lerp_first_unsigned;
+         if (lerp_first != spv::NoResult) {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 8d54a2a..37bd30e 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -159,6 +159,9 @@ bool PacingEnabled();
+ 
+ namespace rex::graphics::vulkan {
+ 
++// Last value read from live_flags.txt, for other files of the backend (shared memory).
++uint32_t g_live_diag_flags = 0;
++
+ namespace {
+ 
+ // Defined next to EndRenderPass; used earlier by the render target transitions.
+@@ -209,6 +212,11 @@ uint64_t g_shadow_seen_last_frame[2] = {};
+ bool g_shadow_in_skipped_pass = false;
+ uint64_t g_shadow_skipped_draws = 0, g_shadow_drawn = 0;
+ 
++// Live flags 262144 / 524288 (only between null-vertex-shader diagnostic pipelines, which use no
++// bindings): skip descriptor set binds / pipeline binds, to time what the binds cost the GPU.
++bool g_diag_skip_descriptor_binds = false;
++bool g_bound_pipeline_diag_null = false;
++
+ uint32_t LiveDiagnosticFlags() {
+   static uint32_t countdown = 0;
+   static uint32_t flags = 0;
+@@ -230,6 +238,7 @@ uint32_t LiveDiagnosticFlags() {
+       }
+       std::fclose(f);
+     }
++    g_live_diag_flags = flags;
+   }
+   return flags;
+ }
+@@ -4714,6 +4723,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       native_vertex_fetch_layout.eligible && !memexport_used_vertex;
+   primitive_processor_->SetHostEndianIndicesRequested(native_vertex_fetch_wanted);
+   native_vertex_fetch_draw_ = false;
++  // Live flags 65536 / 131072: shader-cost diagnostic pipeline variants (pipeline_cache.h).
++  g_pipeline_diag_variant.store((LiveDiagnosticFlags() >> 16) & 3, std::memory_order_relaxed);
+ 
+   // Two iterations because a submission (even the current one - in which case
+   // it needs to be ended, and a new one must be started) may need to be awaited
+@@ -5072,10 +5083,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+     return draw_fail("pipeline_lookup");
+   }
+-  if (current_guest_graphics_pipeline_ != pipeline) {
++  const bool diag_null_pipeline = pipeline_cache_->last_pipeline_is_diag_null();
++  g_diag_skip_descriptor_binds =
++      diag_null_pipeline && (LiveDiagnosticFlags() & 262144u) != 0;
++  if (current_guest_graphics_pipeline_ != pipeline &&
++      !(diag_null_pipeline && g_bound_pipeline_diag_null &&
++        current_guest_graphics_pipeline_ != VK_NULL_HANDLE &&
++        (LiveDiagnosticFlags() & 524288u) != 0)) {
+     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+     current_guest_graphics_pipeline_ = pipeline;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
++    g_bound_pipeline_diag_null = diag_null_pipeline;
+   }
+ 
+   // Update the graphics pipeline, and if the new graphics pipeline has a
+@@ -5508,8 +5526,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     commit_census_draw();
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1,
+-                                       uint32_t(native_base_index), 0);
++    // Live flag 1048576: record everything but the draw itself (diagnostic).
++    if (!(LiveDiagnosticFlags() & 1048576u)) {
++      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1,
++                                         uint32_t(native_base_index), 0);
++    }
+     if (LiveDiagnosticFlags() & (32u | 64u)) {
+       // 32: two extra identical draws. 64: the same, but with a 1x1 scissor (no fragments).
+       const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
+@@ -5582,8 +5603,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     commit_census_draw();
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+-                                              0, native_base_index, 0);
++    if (!(LiveDiagnosticFlags() & 1048576u)) {
++      deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
++                                                1, 0, native_base_index, 0);
++    }
+     if (LiveDiagnosticFlags() & (32u | 64u)) {
+       const bool tiny = (LiveDiagnosticFlags() & 64u) != 0;
+       if (tiny) {
+@@ -8558,6 +8581,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   if (!texture_count_pixel && !sampler_count_pixel) {
+     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+   }
++  if (g_diag_skip_descriptor_binds) {
++    // Diagnostic: nothing bound and nothing marked bound (the next real draw binds).
++    return true;
++  }
+   uint32_t descriptor_sets_remaining =
+       descriptor_sets_needed & ~current_graphics_descriptor_sets_bound_up_to_date_;
+   uint32_t descriptor_set_index;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index d250533..5210595 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -41,6 +41,7 @@
+ #include <rex/graphics/pipeline_util.h>
+ #include <rex/graphics/pipeline/shader/spirv_builder.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
++#include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/graphics/register_file.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
+@@ -64,6 +65,30 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_fast_pixel_shader_math, false, "GPU/Vulkan",
++                    "Translate pixel shaders with fused multiply-add allowed and IEEE multiplication "
++                    "by zero (not bit-exact Xenos math; much shorter shaders). Live flag 8388608 "
++                    "inverts it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++REXCVAR_DEFINE_BOOL(gpu_implicit_texture_lod, false, "GPU/Vulkan",
++                    "Pixel shader texture fetches with computed LOD use implicit LOD + bias instead "
++                    "of explicit gradients (same result, much faster on Adreno). Live flag "
++                    "16777216 inverts it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++REXCVAR_DEFINE_BOOL(gpu_static_texture_signs, false, "GPU/Vulkan",
++                    "Translate pixel shaders with the texture signedness / gamma and result "
++                    "exponent bias of the current draw as constants (pipeline variants per "
++                    "texture sign class; removes per-pixel branching). Live flag 67108864 "
++                    "inverts it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++REXCVAR_DEFINE_BOOL(gpu_ieee_vertex_shader_mul, false, "GPU/Vulkan",
++                    "Translate vertex shaders with IEEE multiplication by zero (0 * inf / NaN not "
++                    "forced to 0; finite results unchanged). Live flag 134217728 inverts it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(gpu_diag_trivial_ps, false, "GPU/Vulkan",
+                     "Diagnostic: replace every translated pixel shader with a constant-colour shader "
+                     "(timing only, output is wrong)")
+@@ -78,6 +103,12 @@ const uint32_t kTrivialPixelShader[] = {
+ 0x07230203,0x00010000,0x000d000a,0x00000013,0x00000000,0x00020011,0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000d,0x0000000f,0x00000011,0x00030010,0x00000004,0x00000007,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000d,0x0000001e,0x00000001,0x00040047,0x0000000f,0x0000001e,0x00000002,0x00040047,0x00000011,0x0000001e,0x00000003,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x0004002b,0x00000006,0x0000000a,0x3f000000,0x0004002b,0x00000006,0x0000000b,0x3f800000,0x0007002c,0x00000007,0x0000000c,0x0000000a,0x0000000a,0x0000000a,0x0000000b,0x0004003b,0x00000008,0x0000000d,0x00000003,0x0004003b,0x00000008,0x0000000f,0x00000003,0x0004003b,0x00000008,0x00000011,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0003003e,0x00000009,0x0000000c,0x0004003d,0x00000007,0x0000000e,0x00000009,0x0003003e,0x0000000d,0x0000000e,0x0004003d,0x00000007,0x00000010,0x00000009,0x0003003e,0x0000000f,0x00000010,0x0004003d,0x00000007,0x00000012,0x00000009,0x0003003e,0x00000011,0x00000012,0x000100fd,0x00010038
+ };
+ VkShaderModule g_trivial_pixel_shader = VK_NULL_HANDLE;
++// Live diagnostic variant 2: gl_Position = 0 (every primitive culled; glslc -O).
++const uint32_t kNullVertexShader[] = {
++0x07230203,0x00010000,0x000d000a,0x00000014,0x00000000,0x00020011,0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,0x0006000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00050048,0x0000000b,0x00000000,0x0000000b,0x00000000,0x00050048,0x0000000b,0x00000001,0x0000000b,0x00000001,0x00050048,0x0000000b,0x00000002,0x0000000b,0x00000003,0x00050048,0x0000000b,0x00000003,0x0000000b,0x00000004,0x00030047,0x0000000b,0x00000002,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040015,0x00000008,0x00000020,0x00000000,0x0004002b,0x00000008,0x00000009,0x00000001,0x0004001c,0x0000000a,0x00000006,0x00000009,0x0006001e,0x0000000b,0x00000007,0x00000006,0x0000000a,0x0000000a,0x00040020,0x0000000c,0x00000003,0x0000000b,0x0004003b,0x0000000c,0x0000000d,0x00000003,0x00040015,0x0000000e,0x00000020,0x00000001,0x0004002b,0x0000000e,0x0000000f,0x00000000,0x0004002b,0x00000006,0x00000010,0x00000000,0x0007002c,0x00000007,0x00000011,0x00000010,0x00000010,0x00000010,0x00000010,0x00040020,0x00000012,0x00000003,0x00000007,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x00050041,0x00000012,0x00000013,0x0000000d,0x0000000f,0x0003003e,0x00000013,0x00000011,0x000100fd,0x00010038
++};
++VkShaderModule g_null_vertex_shader = VK_NULL_HANDLE;
++VkShaderModule g_diag_trivial_pixel_shader = VK_NULL_HANDLE;
+ 
+ constexpr std::string_view kPlaceholderPixelShaderSource = R"(#version 460
+ layout(location = 0) out vec4 oC0;
+@@ -288,6 +319,16 @@ void main() {
+ 
+ }  // namespace
+ 
++std::atomic<uint32_t> g_pipeline_diag_variant{0};
++// command_processor.cpp: last live_flags.txt value. 4194304 = force the early depth hint even with
++// alpha test / alpha to coverage on (diagnostic: alpha-tested edges become wrong).
++extern uint32_t g_live_diag_flags;
++namespace {
++// Pixel shader depth/stencil mode census: early hint, blocked by alpha test / coverage, blocked by
++// the shader itself (kill / depth write / memexport). Logged every 200k pixel shader draws.
++uint64_t g_dsm_census[3] = {};
++}  // namespace
++
+ VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
+                                          const RegisterFile& register_file,
+                                          VulkanRenderTargetCache& render_target_cache,
+@@ -321,6 +362,10 @@ bool VulkanPipelineCache::Initialize() {
+       render_target_cache_.draw_resolution_scale_x(),
+       render_target_cache_.draw_resolution_scale_y());
+ 
++  g_diag_trivial_pixel_shader = ui::vulkan::util::CreateShaderModule(
++      vulkan_device, kTrivialPixelShader, sizeof(kTrivialPixelShader));
++  g_null_vertex_shader = ui::vulkan::util::CreateShaderModule(vulkan_device, kNullVertexShader,
++                                                              sizeof(kNullVertexShader));
+   if (REXCVAR_GET(gpu_diag_trivial_ps)) {
+     g_trivial_pixel_shader = ui::vulkan::util::CreateShaderModule(
+         vulkan_device, kTrivialPixelShader, sizeof(kTrivialPixelShader));
+@@ -1003,6 +1048,9 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
+   modification.vertex.vertex_kill_and = uint32_t(
+       device_properties.shaderCullDistance &&
+       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
++  modification.vertex.ieee_mul =
++      host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
++      REXCVAR_GET(gpu_ieee_vertex_shader_mul) != ((g_live_diag_flags & 134217728u) != 0);
+ 
+   return modification;
+ }
+@@ -1036,6 +1084,35 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
+     modification.pixel.param_gen_point = 0;
+   }
+ 
++  modification.pixel.fast_math =
++      REXCVAR_GET(gpu_fast_pixel_shader_math) != ((g_live_diag_flags & 8388608u) != 0);
++  modification.pixel.implicit_lod =
++      REXCVAR_GET(gpu_implicit_texture_lod) != ((g_live_diag_flags & 16777216u) != 0);
++  modification.pixel.diag_no_texture_sample = (g_live_diag_flags & 33554432u) != 0;
++  if (REXCVAR_GET(gpu_static_texture_signs) != ((g_live_diag_flags & 67108864u) != 0)) {
++    uint32_t sign_classes = 0, seen = 0, ordinal = 0;
++    bool exp_bias_zero = true;
++    for (const Shader::TextureBinding& binding : shader.texture_bindings()) {
++      const uint32_t bit = UINT32_C(1) << binding.fetch_constant;
++      if (seen & bit) {
++        continue;
++      }
++      seen |= bit;
++      const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
++      if (fetch.exp_adjust) {
++        exp_bias_zero = false;
++      }
++      if (ordinal < 5) {
++        const uint8_t signs = texture_util::SwizzleSigns(fetch);
++        const uint32_t sign_class = signs == 0x00 ? 1 : signs == 0xFF ? 2 : signs == 0x3F ? 3 : 0;
++        sign_classes |= sign_class << (2 * ordinal);
++      }
++      ++ordinal;
++    }
++    modification.pixel.texture_sign_classes = sign_classes;
++    modification.pixel.texture_exp_bias_zero = exp_bias_zero;
++  }
++
+   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+@@ -1048,10 +1125,21 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
+     } else {
+       if (shader.implicit_early_z_write_allowed() &&
+           (!shader.writes_color_target(0) ||
+-           !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
++           !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()) ||
++           (g_live_diag_flags & 4194304u))) {
+         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
++        ++g_dsm_census[0];
+       } else {
+         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
++        ++g_dsm_census[shader.implicit_early_z_write_allowed() ? 1 : 2];
++      }
++      const uint64_t dsm_total = g_dsm_census[0] + g_dsm_census[1] + g_dsm_census[2];
++      if (dsm_total >= 200000) {
++        REXGPU_INFO("pixel shader depth mode census ({} draws): early {:.1f}%, alpha test/coverage "
++                    "{:.1f}%, shader kills/writes depth {:.1f}%",
++                    dsm_total, 100.0 * g_dsm_census[0] / dsm_total,
++                    100.0 * g_dsm_census[1] / dsm_total, 100.0 * g_dsm_census[2] / dsm_total);
++        g_dsm_census[0] = g_dsm_census[1] = g_dsm_census[2] = 0;
+       }
+     }
+   }
+@@ -1146,6 +1234,13 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
+     return false;
+   }
++  if (const uint32_t diag_variant = g_pipeline_diag_variant.load(std::memory_order_relaxed)) {
++    if (description.geometry_shader == PipelineGeometryShader::kNone &&
++        primitive_processing_result.host_vertex_shader_type ==
++            Shader::HostVertexShaderType::kVertex) {
++      description.diag_variant = diag_variant & 3;
++    }
++  }
+   if (last_pipeline_ && last_pipeline_->first == description) {
+     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
+     const PipelineLayoutProvider* last_pipeline_layout =
+@@ -1241,7 +1336,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     pipeline.second.is_placeholder.store(false, std::memory_order_release);
+   }
+ 
+-  if (pipeline_storage_file_) {
++  if (pipeline_storage_file_ && !description.diag_variant) {
+     assert_not_null(storage_write_thread_);
+     pipeline_storage_file_flush_needed_ = true;
+     {
+@@ -3166,6 +3261,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     shader_stage_vertex.stage = VK_SHADER_STAGE_VERTEX_BIT;
+     shader_stage_vertex.module = creation_arguments.vertex_shader->shader_module();
+     assert_true(shader_stage_vertex.module != VK_NULL_HANDLE);
++    if ((description.diag_variant & 2) && g_null_vertex_shader != VK_NULL_HANDLE) {
++      shader_stage_vertex.module = g_null_vertex_shader;
++    }
+     shader_stage_vertex.pName = "main";
+     shader_stage_vertex.pSpecializationInfo = nullptr;
+   }
+@@ -3204,6 +3302,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     if (g_trivial_pixel_shader != VK_NULL_HANDLE) {
+       shader_stage_fragment.module = g_trivial_pixel_shader;
+     }
++    if (description.diag_variant && g_diag_trivial_pixel_shader != VK_NULL_HANDLE) {
++      shader_stage_fragment.module = g_diag_trivial_pixel_shader;
++    }
+   } else {
+     if (edram_fragment_shader_interlock) {
+       shader_stage_fragment.module = depth_only_fragment_shader_;
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index fbc02e6..fa6f01f 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -47,6 +47,9 @@ REXCVAR_DECLARE(bool, gpu_native_residency);
+ 
+ namespace rex::graphics::vulkan {
+ 
++// command_processor.cpp: live flag 2097152 drops shared memory upload copies (diagnostic, garbage).
++extern uint32_t g_live_diag_flags;
++
+ // Staging alignment for unwatched uploads. Buffer to buffer copies have no
+ // alignment requirement of their own, so this only keeps the memcpy source and
+ // destination friendly; the destination offset in the shared memory buffer is
+@@ -420,8 +423,10 @@ void VulkanSharedMemory::FlushHoistedUploads() {
+     for (; i < hoisted_copies_.size() && hoisted_copies_[i].first == src; ++i) {
+       upload_regions_.push_back(hoisted_copies_[i].second);
+     }
+-    command_buffer.CmdVkCopyBuffer(src, buffer_, uint32_t(upload_regions_.size()),
+-                                   upload_regions_.data());
++    if (!(g_live_diag_flags & 2097152u)) {
++      command_buffer.CmdVkCopyBuffer(src, buffer_, uint32_t(upload_regions_.size()),
++                                     upload_regions_.data());
++    }
+   }
+   upload_regions_.clear();
+   hoisted_copies_.clear();
+@@ -495,8 +500,10 @@ bool VulkanSharedMemory::UploadRanges(
+                   upload_buffer_size);
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
++        if (!(g_live_diag_flags & 2097152u)) {
++          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
++                                         uint32_t(upload_regions_.size()), upload_regions_.data());
++        }
+         upload_regions_.clear();
+       }
+       upload_buffer_previous = upload_buffer;
+@@ -514,8 +521,10 @@ bool VulkanSharedMemory::UploadRanges(
+   }
+   if (!upload_regions_.empty()) {
+     assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-    command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
++    if (!(g_live_diag_flags & 2097152u)) {
++      command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
++                                     uint32_t(upload_regions_.size()), upload_regions_.data());
++    }
+     upload_regions_.clear();
+   }
+   return successful;

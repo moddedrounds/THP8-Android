@@ -1,0 +1,963 @@
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..186bdb8 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -51,7 +51,13 @@ function(rexglue_apply_target_settings target_name)
+             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+             target_compile_options(${target_name} PRIVATE -mcmodel=large)
+         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
++            # Android targets are Armv8.2+ phones/handhelds: inline LSE atomics instead of the
++            # out-of-line __aarch64_* helpers (a per-target -march here overrides the app's global one).
++            if(ANDROID)
++                target_compile_options(${target_name} PRIVATE -march=armv8.2-a)
++            else()
++                target_compile_options(${target_name} PRIVATE -march=armv8-a)
++            endif()
+         endif()
+     endif()
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4fea04d..15af73d 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -157,6 +157,14 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // Call once per guest frame (at the swap): ages the volatile-page heuristics and applies the
++  // backend's VolatilePagesAllowed() switch.
++  void OnFrameEnd();
++  // Call when the command processor finishes a primary (ring) buffer batch. Volatile pages are
++  // compared with their shadow at most once per batch: the guest cannot change data a kicked
++  // batch refers to until the GPU is past it.
++  void OnBatchEnd() { ++batch_epoch_; }
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+@@ -176,6 +184,14 @@ class SharedMemory {
+ 
+   uint32_t page_size_log2() const { return page_size_log2_; }
+ 
++  // Volatile pages: guest pages re-uploaded in several consecutive frames (dynamic vertex data
++  // and the like). They are left writable instead of being write-watched again after every upload
++  // (an mprotect per upload plus a guest fault per frame) and are validated at request time by
++  // comparing them with a shadow copy of what was last uploaded, which also skips re-uploading
++  // pages a widened invalidation flagged without them changing. Never used for pages with watches
++  // (textures) or GPU-written data. The backend decides whether the mechanism is on.
++  virtual bool VolatilePagesAllowed() const { return false; }
++
+   // Upload-ahead: widens each (sorted) page run over the contiguous invalid pages around it within
+   // its 64-page block and merges runs that then touch. A guest write invalidates a whole 256 KB
+   // block, which draws would otherwise re-upload (and re-protect) a few pages at a time.
+@@ -266,6 +282,21 @@ class SharedMemory {
+   // Things below should be fully protected by global_critical_region.
+   // ***************************************************************************
+ 
++  // Volatile pages (see VolatilePagesAllowed), all indexed by system page.
++  std::vector<uint8_t> page_volatile_;
++  std::vector<uint8_t> page_upload_streak_;
++  std::vector<uint32_t> page_upload_frame_;
++  std::vector<std::unique_ptr<uint8_t[]>> page_shadow_;
++  std::vector<uint32_t> volatile_unchanged_temp_;
++  std::vector<uint32_t> page_checked_epoch_;
++  uint32_t batch_epoch_ = 1;
++  uint32_t volatile_count_ = 0;
++  uint32_t frame_index_ = 0;
++  bool volatile_active_ = false;
++  bool PageWatched(uint32_t page) const;
++  // valid_after: whether the demoted pages count as in sync (true right after a request of them).
++  void DemoteVolatilePages(uint32_t page_first, uint32_t page_last, bool valid_after);
++
+   // Pages whose contents in the buffer are in sync with guest memory.
+   std::vector<uint64_t> system_page_flags_valid_;
+   // Subset of valid pages containing data written by the GPU.
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index ca6ab55..b6725dc 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -53,11 +53,18 @@ class VulkanSharedMemory : public SharedMemory {
+   // current render pass).
+   bool IsPlainRead() const { return last_usage_ == Usage::kRead && !last_written_range_.second; }
+ 
++  // Uploads hoisted in front of the current render pass are collected and inserted there in one
++  // block (barrier, copies, barrier) by this call, instead of splicing every upload into the
++  // command stream separately (each splice moved the whole pass recorded so far). The command
++  // processor calls it before the pass ends and before inserting any other hoisted block.
++  void FlushHoistedUploads();
++
+  protected:
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                         uint32_t length_allocations) override;
+ 
+   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
++  bool VolatilePagesAllowed() const override;
+ 
+   bool UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size,
+                                 const void* host_src) override;
+@@ -87,6 +94,7 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
++  std::vector<std::pair<VkBuffer, VkBufferCopy>> hoisted_copies_;
+   std::vector<std::pair<uint32_t, uint32_t>> upload_ahead_ranges_;
+   // Outcome of the last hoisted upload (TryUploadRangesBeforeRenderPass returns whether it handled
+   // the request, not whether the copy succeeded).
+diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
+index 1316402..4ac5a09 100644
+--- a/include/rex/perf/counter.h
++++ b/include/rex/perf/counter.h
+@@ -166,6 +166,12 @@ enum class CounterId : uint16_t {
+   kGpuBusyUs,
+   kGpuSubmissions,
+   kFenceWaitUs,
++  // Command processor per frame: thread CPU time, time waiting for ring data from the guest, time
++  // in WAIT_REG_MEM waits (the game's vsync wait), time in the gpu_swap_fps_cap wait.
++  kCpCpuUs,
++  kCpRingIdleUs,
++  kCpRegMemWaitUs,
++  kCpCapWaitUs,
+ 
+   kCount  // sentinel -- must be last
+ };
+diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
+index c71ae2c..9cd3a4b 100644
+--- a/src/core/perf/counter.cpp
++++ b/src/core/perf/counter.cpp
+@@ -77,6 +77,10 @@ constexpr const char* kCounterNames[] = {
+     "gpu_busy_us",
+     "gpu_submissions",
+     "fence_wait_us",
++    "cp_cpu_us",
++    "cp_ring_idle_us",
++    "cp_regmem_wait_us",
++    "cp_cap_wait_us",
+ };
+ static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
+ 
+@@ -128,6 +132,10 @@ constexpr bool kIsGauge[] = {
+     false,  // kGpuBusyUs
+     false,  // kGpuSubmissions
+     false,  // kFenceWaitUs
++    false,  // kCpCpuUs
++    false,  // kCpRingIdleUs
++    false,  // kCpRegMemWaitUs
++    false,  // kCpCapWaitUs
+ };
+ static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a202ad5..f4c8a66 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,9 +10,11 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cinttypes>
+ #include <ctime>
++#include <condition_variable>
+ #include <map>
+ #include <mutex>
+ #include <string>
+@@ -128,6 +130,40 @@ REXCVAR_DEFINE_BOOL(gpu_pacing_trace, false, "GPU",
+ 
+ // Frame-pacing trace (diagnostic): (time, code, arg) events from the CP, vsync and interrupt paths,
+ // dumped as one log line every 150 swaps covering the last 120 ms.
++REXCVAR_DEFINE_UINT32(gpu_swap_fps_cap, 0, "GPU",
++                      "Cap guest swaps to this rate (0 = off): before a swap the command processor "
++                      "waits until 60/cap guest vblanks have passed since the previous one, so a "
++                      "game that runs uncapped presents at an even cadence (30 = every 2nd vblank).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// Guest vblank count for the swap cap (incremented by GraphicsSystem::MarkVblank).
++namespace {
++std::mutex g_vblank_mutex;
++std::condition_variable g_vblank_cv;
++std::atomic<uint64_t> g_vblank_count{0};
++std::chrono::steady_clock::time_point g_vblank_time;
++}  // namespace
++// Time left until the next guest vblank (predicted from the last one at 60 Hz); negative or zero
++// when one is due. Used to spin instead of sleeping across an imminent vblank.
++std::chrono::microseconds TimeToNextGuestVblank() {
++  std::chrono::steady_clock::time_point last;
++  {
++    std::lock_guard<std::mutex> lock(g_vblank_mutex);
++    last = g_vblank_time;
++  }
++  return std::chrono::duration_cast<std::chrono::microseconds>(
++      last + std::chrono::microseconds(16667) - std::chrono::steady_clock::now());
++}
++
++void NoteGuestVblank() {
++  {
++    std::lock_guard<std::mutex> lock(g_vblank_mutex);
++    ++g_vblank_count;
++    g_vblank_time = std::chrono::steady_clock::now();
++  }
++  g_vblank_cv.notify_all();
++}
++
+ bool PacingEnabled() {
+   static const bool enabled = REXCVAR_GET(gpu_pacing_trace);
+   return enabled;
+@@ -489,6 +525,7 @@ void CommandProcessor::WorkerThreadMain() {
+       // shared with the whole guest) a long sched_yield spin steals a big
+       // core from the game thread while the ring stays empty, so fall back to
+       // event waits quickly.
++      const auto ring_wait_start = std::chrono::steady_clock::now();
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -505,6 +542,10 @@ void CommandProcessor::WorkerThreadMain() {
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++      rex::perf::IncrementCounter(rex::perf::CounterId::kCpRingIdleUs,
++                                  std::chrono::duration_cast<std::chrono::microseconds>(
++                                      std::chrono::steady_clock::now() - ring_wait_start)
++                                      .count());
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+@@ -1358,11 +1399,77 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
+ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
++  if (const uint32_t cap = REXCVAR_GET(gpu_swap_fps_cap)) {
++    static uint64_t last_swap_vblank = 0;
++    const uint64_t interval = std::max<uint64_t>(1, (60 + cap / 2) / cap);
++    std::unique_lock<std::mutex> lock(g_vblank_mutex);
++    const uint64_t target = last_swap_vblank + interval;
++    if (g_vblank_count < target && target - g_vblank_count <= interval) {
++      PacingTrace('C', uint32_t(target - g_vblank_count));
++      const auto cap_start = std::chrono::steady_clock::now();
++      // Sleep until ~1.5 ms before the target vblank, then spin (wakes after a sleep were measured
++      // 2-5 ms late on Android).
++      const auto target_time = g_vblank_time + std::chrono::microseconds(16667) *
++                                                   int64_t(target - g_vblank_count);
++      g_vblank_cv.wait_until(lock, target_time - std::chrono::microseconds(3000),
++                             [target] { return g_vblank_count >= target; });
++      const auto spin_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
++      // Spin without the lock (NoteGuestVblank needs it to advance the count).
++      lock.unlock();
++      while (g_vblank_count.load(std::memory_order_acquire) < target &&
++             std::chrono::steady_clock::now() < spin_deadline) {
++      }
++      lock.lock();
++      g_vblank_cv.wait_for(lock, std::chrono::milliseconds(100),
++                           [target] { return g_vblank_count >= target; });
++      if (PacingEnabled()) {
++        // Wake latency after the vblank that released the cap.
++        static uint64_t waits = 0, late_1ms = 0, late_3ms = 0;
++        static int64_t late_max_us = 0;
++        const int64_t late_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                    std::chrono::steady_clock::now() - g_vblank_time)
++                                    .count();
++        ++waits;
++        late_1ms += late_us > 1000;
++        late_3ms += late_us > 3000;
++        late_max_us = std::max(late_max_us, late_us);
++        if (waits % 300 == 0) {
++          REXGPU_INFO("swap cap: {} waits, CP woke >1 ms after the vblank {}, >3 ms {}, max {:.1f} ms",
++                      waits, late_1ms, late_3ms, late_max_us / 1000.0);
++          late_1ms = late_3ms = 0;
++          late_max_us = 0;
++        }
++      }
++      rex::perf::IncrementCounter(rex::perf::CounterId::kCpCapWaitUs,
++                                  std::chrono::duration_cast<std::chrono::microseconds>(
++                                      std::chrono::steady_clock::now() - cap_start)
++                                      .count());
++    }
++    last_swap_vblank = g_vblank_count;
++  }
+   PacingTrace('S', 0);
++  {
++    static uint32_t last_cpu_tenths = ThreadCpuTenthsMs();
++    const uint32_t cpu_tenths = ThreadCpuTenthsMs();
++    rex::perf::SetCounter(rex::perf::CounterId::kCpCpuUs, int64_t(cpu_tenths - last_cpu_tenths) * 100);
++    last_cpu_tenths = cpu_tenths;
++  }
+   {
+     static uint32_t swaps = 0;
+-    if (PacingEnabled() && ++swaps % 150 == 0) {
+-      PacingDump();
++    static auto last_swap = std::chrono::steady_clock::now();
++    static auto last_slow_dump = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    const bool slow = now - last_swap > std::chrono::microseconds(35000);
++    last_swap = now;
++    if (PacingEnabled()) {
++      ++swaps;
++      if (slow && now - last_slow_dump > std::chrono::milliseconds(500)) {
++        last_slow_dump = now;
++        REXGPU_INFO("pacing: slow frame, trace follows");
++        PacingDump();
++      } else if (swaps % 150 == 0) {
++        PacingDump();
++      }
+     }
+   }
+ 
+@@ -1458,6 +1565,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     uint64_t key;
+     bool* waited;
+     ~WaitStatScope() {
++      if (*waited) {
++        rex::perf::IncrementCounter(rex::perf::CounterId::kCpRegMemWaitUs,
++                                    std::chrono::duration_cast<std::chrono::microseconds>(
++                                        std::chrono::steady_clock::now() - start)
++                                        .count());
++      }
+       if (!PacingEnabled()) {
+         return;
+       }
+@@ -1549,8 +1662,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         // inactive trace writer and ReturnFromWait is empty - so a short sleep
+         // gets the latency back without the spin.
+         constexpr auto kMaxPollWait = std::chrono::microseconds(125);
+-        if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
++        if (!REXCVAR_GET(vsync) || TimeToNextGuestVblank() < std::chrono::microseconds(1500)) {
++          // User wants it fast and dangerous - or a vblank (what these waits usually wait for) is
++          // imminent and a sleep could wake milliseconds late.
+           rex::thread::MaybeYield();
+         } else {
+           auto requested = std::chrono::duration_cast<std::chrono::microseconds>(
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index cb131ba..6ed0507 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -63,6 +63,8 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ 
+ namespace rex::graphics {
+ 
++bool PacingEnabled();
++
+ // Nvidia Optimus/AMD PowerXpress support.
+ // These exports force the process to trigger the discrete GPU in multi-GPU
+ // systems.
+@@ -183,9 +185,43 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             // Not std::this_thread::sleep_until: on Windows that is ::Sleep(),
+             // quantised to the system timer period, so the deadline this loop
+             // is built around cannot actually be met.
+-            rex::thread::SleepUntil(next_wake);
++            // Sleep to just before the edge and spin the rest: a wake after a
++            // plain sleep was measured up to 3-4 ms late on Android, which
++            // moved the guest's vblank and with it the swap.
++            // 3 ms: wakes up to ~2.5 ms late were still seen with a 1 ms margin.
++            const auto spin_from = next_wake - std::chrono::microseconds(3000);
++            if (spin_from > now) {
++              rex::thread::SleepUntil(spin_from);
++            }
++            while (std::chrono::steady_clock::now() < next_wake) {
++            }
++          }
++          static uint64_t vb_wakes = 0, vb_late_1ms = 0, vb_late_3ms = 0, vb_zero = 0, vb_multi = 0;
++          static int64_t vb_late_max_us = 0;
++          const bool vb_stats = PacingEnabled();
++          if (vb_stats) {
++            const int64_t late_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                        std::chrono::steady_clock::now() - next_wake)
++                                        .count();
++            ++vb_wakes;
++            vb_late_1ms += late_us > 1000;
++            vb_late_3ms += late_us > 3000;
++            vb_late_max_us = std::max(vb_late_max_us, late_us);
+           }
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
++          if (vb_stats) {
++            const uint64_t pending = (current_time - last_frame_time) / interval_ticks;
++            vb_zero += pending == 0;
++            vb_multi += pending > 1;
++            if (vb_wakes % 600 == 0) {
++              REXGPU_INFO("vsync thread: {} wakes, late >1 ms {}, >3 ms {}, max {:.1f} ms; "
++                          "wakes delivering 0 vblanks {}, >1 vblank {}",
++                          vb_wakes, vb_late_1ms, vb_late_3ms, vb_late_max_us / 1000.0, vb_zero,
++                          vb_multi);
++              vb_late_1ms = vb_late_3ms = vb_zero = vb_multi = 0;
++              vb_late_max_us = 0;
++            }
++          }
+           if (current_time - last_frame_time >= interval_ticks) {
+             // Deliver the vblanks that actually elapsed, not one per wake.
+             //
+@@ -361,6 +397,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+ 
+ void PacingTrace(char code, uint32_t arg);
+ bool PacingEnabled();
++void NoteGuestVblank();
+ 
+ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+@@ -375,6 +412,7 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   PacingTrace('V', 0);
++  NoteGuestVblank();
+   DispatchInterruptCallback(0, 2);
+   if (memory_ && PacingEnabled()) {
+     PacingTrace('f', *reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(0x1FCA3004)));
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 50eab98..cf9c100 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <memory>
+ #include <utility>
+ 
+ #include <rex/graphics/flags.h>
+@@ -38,6 +39,13 @@ void SharedMemory::InitializeCommon() {
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+   page_write_seq_.assign(size_t(kBufferSize >> page_size_log2_), 0);
+   upload_seq_ = 0;
++  page_volatile_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  page_upload_streak_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  page_upload_frame_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  page_checked_epoch_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  page_shadow_.clear();
++  page_shadow_.resize(size_t(kBufferSize >> page_size_log2_));
++  volatile_count_ = 0;
+ 
+   memory_invalidation_callback_handle_ =
+       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+@@ -180,6 +188,9 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  // A watched page must fault on guest writes again (it was just requested, so it is in sync).
++  DemoteVolatilePages(watch_page_first, watch_page_last, true);
++
+   // Allocate the range.
+   WatchRange* range = watch_range_first_free_;
+   if (range != nullptr) {
+@@ -312,11 +323,13 @@ void SharedMemory::ExtendUploadRangesOverInvalid(
+       const uint32_t first_min = first - std::min(first & 63, max_extra_pages);
+       const uint32_t last_max = last + std::min(63 - (last & 63), max_extra_pages);
+       const uint64_t valid_first = system_page_flags_valid_[first >> 6];
+-      while (first > first_min && !((valid_first >> ((first - 1) & 63)) & 1)) {
++      while (first > first_min && !((valid_first >> ((first - 1) & 63)) & 1) &&
++             !page_volatile_[first - 1]) {
+         --first;
+       }
+       const uint64_t valid_last = system_page_flags_valid_[last >> 6];
+-      while (last < last_max && !((valid_last >> ((last + 1) & 63)) & 1)) {
++      while (last < last_max && !((valid_last >> ((last + 1) & 63)) & 1) &&
++             !page_volatile_[last + 1]) {
+         ++last;
+       }
+       range = std::make_pair(first, last - first + 1);
+@@ -337,6 +350,54 @@ void SharedMemory::ExtendUploadRangesOverInvalid(
+   page_ranges.resize(write + 1);
+ }
+ 
++bool SharedMemory::PageWatched(uint32_t page) const {
++  for (const WatchNode* node = watch_buckets_[(page << page_size_log2_) >> kWatchBucketSizeLog2];
++       node; node = node->bucket_node_next) {
++    if (node->range->page_first <= page && node->range->page_last >= page) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void SharedMemory::DemoteVolatilePages(uint32_t page_first, uint32_t page_last, bool valid_after) {
++  // Caller holds the global critical region.
++  if (!volatile_count_) {
++    return;
++  }
++  bool any = false;
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    if (!page_volatile_[page]) {
++      continue;
++    }
++    page_volatile_[page] = 0;
++    page_upload_streak_[page] = 0;
++    page_shadow_[page].reset();
++    --volatile_count_;
++    any = true;
++    if (valid_after) {
++      system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++    } else {
++      system_page_flags_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
++    }
++  }
++  if (any && valid_after && memory_invalidation_callback_handle_) {
++    memory().EnablePhysicalMemoryAccessCallbacks(
++        page_first << page_size_log2_, (page_last - page_first + 1) << page_size_log2_, true,
++        false);
++  }
++}
++
++void SharedMemory::OnFrameEnd() {
++  ++frame_index_;
++  const bool allowed = VolatilePagesAllowed();
++  if (!allowed && volatile_count_) {
++    auto global_lock = global_critical_region_.Acquire();
++    DemoteVolatilePages(0, (kBufferSize >> page_size_log2_) - 1, false);
++  }
++  volatile_active_ = allowed;
++}
++
+ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu) {
+   if (length == 0 || start >= kBufferSize) {
+     return;
+@@ -367,6 +428,51 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
+       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+     }
++
++    if (written_by_gpu) {
++      DemoteVolatilePages(valid_page_first, valid_page_last, true);
++    } else if (volatile_active_) {
++      // Pages re-uploaded in 4+ frames in a row become volatile; volatile pages stay invalid (so
++      // every request compares them with their shadow) and are not write-watched again.
++      bool any_volatile = false;
++      for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
++        if (!page_volatile_[page]) {
++          const uint32_t since = frame_index_ - page_upload_frame_[page];
++          if (since == 0) {
++            continue;  // Several uploads in one frame count once.
++          }
++          page_upload_streak_[page] =
++              since <= 2 ? uint8_t(std::min(page_upload_streak_[page] + 1, 255)) : uint8_t(1);
++          page_upload_frame_[page] = frame_index_;
++          if (page_upload_streak_[page] < 4 || PageWatched(page)) {
++            continue;
++          }
++          page_volatile_[page] = 1;
++          ++volatile_count_;
++        }
++        any_volatile = true;
++        system_page_flags_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
++      }
++      if (any_volatile) {
++        // Re-arm only the non-volatile runs.
++        if (memory_invalidation_callback_handle_ && !REXCVAR_GET(gpu_watch_rearm_oracle)) {
++          uint32_t run_first = UINT32_MAX;
++          for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
++            const bool rearm = page <= valid_page_last && !page_volatile_[page];
++            if (rearm && run_first == UINT32_MAX) {
++              run_first = page;
++            } else if (!rearm && run_first != UINT32_MAX) {
++              PERF_counter_inc(kWatchRearms);
++              memory().EnablePhysicalMemoryAccessCallbacks(
++                  run_first << page_size_log2_, (page - run_first) << page_size_log2_, true,
++                  false);
++              run_first = UINT32_MAX;
++            }
++          }
++        }
++        return;
++      }
++    }
+   }
+ 
+   if (memory_invalidation_callback_handle_) {
+@@ -505,6 +611,38 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   };
+   {
+     auto global_lock = global_critical_region_.Acquire();
++    volatile_unchanged_temp_.clear();
++    if (volatile_count_) {
++      const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++        const uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++        for (uint32_t page = range.first >> page_size_log2_; page <= page_last; ++page) {
++          if (!page_volatile_[page]) {
++            continue;
++          }
++          if (page_checked_epoch_[page] == batch_epoch_) {
++            // Compared (and uploaded if it differed) earlier in this batch: in sync.
++            system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++            volatile_unchanged_temp_.push_back(page);
++            continue;
++          }
++          page_checked_epoch_[page] = batch_epoch_;
++          const uint8_t* guest = reinterpret_cast<const uint8_t*>(
++              memory().TranslatePhysical(page << page_size_log2_));
++          std::unique_ptr<uint8_t[]>& shadow = page_shadow_[page];
++          if (shadow && !std::memcmp(guest, shadow.get(), page_bytes)) {
++            // Unchanged since it was last uploaded: in sync for this request.
++            system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++            volatile_unchanged_temp_.push_back(page);
++          } else {
++            if (!shadow) {
++              shadow.reset(new uint8_t[page_bytes]);
++            }
++            std::memcpy(shadow.get(), guest, page_bytes);
++          }
++        }
++      }
++    }
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -553,6 +691,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+         append_upload_range(range_start, page_last + 1 - range_start);
+       }
+     }
++    for (uint32_t page : volatile_unchanged_temp_) {
++      system_page_flags_valid_[page >> 6] &= ~(uint64_t(1) << (page & 63));
++    }
+   }
+ 
+   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 7204638..2780991 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -14,6 +14,7 @@
+ #include <atomic>
+ #include <bit>
+ #include <chrono>
++#include <optional>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+@@ -144,6 +145,9 @@ void NoteRenderPassEnd(const char* file, uint32_t line);
+ constexpr uint32_t kCompletionSlots = 256;
+ VkQueryPool g_completion_pool = VK_NULL_HANDLE;
+ uint64_t g_completion_armed_of[kCompletionSlots] = {};
++// The slot's value before this submission's stamp: the in-command-buffer reset only runs once the GPU
++// reaches the submission, so until then the slot still shows the stamp of its previous user.
++uint64_t g_completion_old_value[kCompletionSlots] = {};
+ 
+ // Per-submission GPU timestamps (top of the submission -> bottom), summed into the gpu_busy_us
+ // counter when the submission is known to be complete. Command processor thread only.
+@@ -2555,6 +2559,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   PacingTimer pacing_timer('X');
++  shared_memory_->OnFrameEnd();
+   ++draw_census_swap_ordinal_;
+   if (LiveDiagnosticFlags() & 4u) {
+     FlushDrawHistogram(draw_census_swap_ordinal_);
+@@ -2661,9 +2666,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+   xenos::TextureFormat frontbuffer_format;
+   bool swap_source_needs_rb_swap = false;
++  std::optional<PacingTimer> swap_texture_timer;
++  swap_texture_timer.emplace('T');
+   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
+       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
++  swap_texture_timer.reset();
+   if (swap_texture_view == VK_NULL_HANDLE) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+     return;
+@@ -2757,6 +2765,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+ 
++  std::optional<PacingTimer> refresh_timer;
++  refresh_timer.emplace('R');
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
+@@ -3899,7 +3909,14 @@ void VulkanCommandProcessor::EndTextureHoist() {
+   if (!texture_hoist_active_) {
+     return;
+   }
+-  const size_t tail_start = texture_hoist_tail_start_;
++  size_t tail_start = texture_hoist_tail_start_;
++  if (in_render_pass_ && render_pass_begin_position_ != SIZE_MAX && shared_memory_) {
++    // Uploads hoisted earlier in this pass (including the ones these loads read) go in front of
++    // the pass first; that shifts this block back by their size.
++    const size_t before = deferred_command_buffer_.Position();
++    shared_memory_->FlushHoistedUploads();
++    tail_start += deferred_command_buffer_.Position() - before;
++  }
+   if (texture_hoist_conflict_) {
+     // Something in the block needs the pass to be over: end it in front of the block, as the
+     // ordinary path would have done at its first barrier.
+@@ -3955,6 +3972,9 @@ void VulkanCommandProcessor::EndRenderPass(const char* reason_file, uint32_t rea
+   if (!in_render_pass_ || texture_hoist_active_) {
+     return;
+   }
++  if (shared_memory_) {
++    shared_memory_->FlushHoistedUploads();
++  }
+   NoteRenderPassEnd(reason_file, reason_line);
+   FinalizePassRenderArea();
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+@@ -4318,6 +4338,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor_in) {
+ }
+ 
+ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
++  shared_memory_->OnBatchEnd();
+   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
+       CanEndSubmissionImmediately()) {
+     EndSubmission(false);
+@@ -6275,20 +6296,25 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   // submission themselves can be executed out of order, but Xenia serializes
+   // that for simplicity.
+   while (fences_awaited < fences_total) {
++    char poll_site = 'u';
+     if (g_completion_pool != VK_NULL_HANDLE && !DiagnosticFlag(2048u)) {
+       const uint64_t submission = submission_completed_ + 1 + fences_awaited;
+       const uint32_t slot = uint32_t(submission % kCompletionSlots);
+       if (g_completion_armed_of[slot] == submission) {
+-        uint64_t stamp;
++        // Turnip flags a query available when the CP parses it (CP_MEM_WRITE); the value is written
++        // by the end-of-pipe event once the work before it has drained (the reset zeroes it first).
++        uint64_t stamp = 0;
+         if (dfn.vkGetQueryPoolResults(device, g_completion_pool, slot, 1, sizeof(stamp), &stamp,
+-                                      sizeof(stamp), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++                                      sizeof(stamp), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS ||
++            !stamp || stamp == g_completion_old_value[slot]) {
+           break;  // Still executing: do not ask the fence (kgsl would block until it signals).
+         }
++        poll_site = 'p';
+       }
+     }
+     VkResult fence_status;
+     {
+-      PacingTimer timer('P');
++      PacingTimer timer(poll_site);
+       fence_status = dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited],
+                                          VK_TRUE, 0);
+     }
+@@ -6449,6 +6475,14 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+       // A slot is reused only kCompletionSlots submissions later, long after its fence was reclaimed.
+       deferred_command_buffer_.CmdVkResetQueryPool(g_completion_pool, slot, 1);
+       g_completion_armed_of[slot] = 0;
++      uint64_t old_value = 0;
++      const ui::vulkan::VulkanDevice* const completion_device = GetVulkanDevice();
++      if (completion_device->functions().vkGetQueryPoolResults(
++              completion_device->device(), g_completion_pool, slot, 1, sizeof(old_value),
++              &old_value, sizeof(old_value), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++        old_value = 0;
++      }
++      g_completion_old_value[slot] = old_value;
+     }
+ 
+     if (g_submission_stamp_pool != VK_NULL_HANDLE) {
+@@ -6718,14 +6752,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     EndRenderPass();
+ 
+-    if (g_completion_pool != VK_NULL_HANDLE) {
+-      const uint64_t submission = GetCurrentSubmission();
+-      const uint32_t slot = uint32_t(submission % kCompletionSlots);
+-      deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+-                                                   g_completion_pool, slot);
+-      g_completion_armed_of[slot] = submission;
+-    }
+-
+     if (g_submission_stamp_current != UINT32_MAX) {
+       deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                    g_submission_stamp_pool,
+@@ -6809,6 +6835,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       return false;
+     }
+     deferred_command_buffer_.Execute(command_buffer.buffer);
++    if (g_completion_pool != VK_NULL_HANDLE) {
++      // The very last command of the submission, so its availability means everything before it
++      // (including what the render target cache recorded at EndSubmission) has executed.
++      const uint64_t submission = GetCurrentSubmission();
++      const uint32_t slot = uint32_t(submission % kCompletionSlots);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              g_completion_pool, slot);
++      g_completion_armed_of[slot] = submission;
++    }
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+       return false;
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 743087d..42c8655 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -326,51 +326,9 @@ bool VulkanSharedMemory::TryUploadRangesBeforeRenderPass(
+     }
+   }
+ 
+-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+-  const size_t tail_start = command_buffer.Position();
+-
+-  // Merge into the pass's existing upload block when there is one (one barrier pair per pass
+-  // instead of one per upload). The block's barriers cover the whole buffer for that.
+-  const uint64_t pass_serial = command_processor_.render_pass_serial();
+-  const bool merging = REXCVAR_GET(gpu_merge_hoisted_uploads) && merge_valid_ &&
+-                       merge_pass_serial_ == pass_serial && merge_position_ <= tail_start;
+-
+-  VkPipelineStageFlags read_stage_mask;
+-  VkAccessFlags read_access_mask;
+-  GetUsageMasks(Usage::kRead, read_stage_mask, read_access_mask);
+-  VkBufferMemoryBarrier barrier;
+-  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+-  barrier.pNext = nullptr;
+-  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-  barrier.buffer = buffer_;
+-  barrier.offset = 0;
+-  barrier.size = VK_WHOLE_SIZE;
+-  if (!REXCVAR_GET(gpu_merge_hoisted_uploads)) {
+-    // Unmerged: a barrier over just the span of this upload, as before.
+-    barrier.offset = VkDeviceSize(upload_page_ranges.front().first) << page_size_log2();
+-    barrier.size = (VkDeviceSize(upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                                 upload_page_ranges.front().first)
+-                    << page_size_log2());
+-  }
+-
+-  if (!merging) {
+-    // Everything that used the buffer before this point (earlier passes, earlier copies) must be
+-    // done with the range before the copy overwrites it.
+-    barrier.srcAccessMask =
+-        read_access_mask | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+-    if (!command_processor_.DiagnosticFlag(2u)) {
+-      command_buffer.CmdVkPipelineBarrier(read_stage_mask | VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+-                                          &barrier, 0, nullptr);
+-    }
+-  }
+-
++  // Stage the data now; the copy commands are inserted in front of the pass by FlushHoistedUploads.
+   const uint64_t submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+-  upload_regions_.clear();
+-  VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
+   for (auto upload_range : upload_page_ranges) {
+     uint32_t upload_range_start = upload_range.first;
+     uint32_t upload_range_length = upload_range.second;
+@@ -389,18 +347,13 @@ bool VulkanSharedMemory::TryUploadRangesBeforeRenderPass(
+       std::memcpy(upload_buffer_mapping,
+                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                   upload_buffer_size);
+-      if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+-        if (!command_processor_.DiagnosticFlag(16u)) {
+-          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                         uint32_t(upload_regions_.size()), upload_regions_.data());
+-        }
+-        upload_regions_.clear();
++      VkBufferCopy region;
++      region.srcOffset = upload_buffer_offset;
++      region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
++      region.size = upload_buffer_size;
++      if (!command_processor_.DiagnosticFlag(16u)) {
++        hoisted_copies_.emplace_back(upload_buffer, region);
+       }
+-      upload_buffer_previous = upload_buffer;
+-      VkBufferCopy& upload_region = upload_regions_.emplace_back();
+-      upload_region.srcOffset = upload_buffer_offset;
+-      upload_region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
+-      upload_region.size = upload_buffer_size;
+       const uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+       upload_range_length -= upload_buffer_pages;
+@@ -409,43 +362,78 @@ bool VulkanSharedMemory::TryUploadRangesBeforeRenderPass(
+       break;
+     }
+   }
+-  if (!upload_regions_.empty()) {
+-    if (!command_processor_.DiagnosticFlag(16u)) {
+-      command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                     uint32_t(upload_regions_.size()), upload_regions_.data());
+-    }
++  hoisted_upload_failed_ = !successful;
++  return true;
++}
++
++REXCVAR_DEFINE_BOOL(gpu_volatile_pages, true, "GPU/Vulkan",
++                    "Keep guest pages that are re-uploaded every frame writable and validate them "
++                    "by comparing with a shadow copy instead of write-watching them (live flag "
++                    "4096 turns it off).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++bool VulkanSharedMemory::VolatilePagesAllowed() const {
++  return REXCVAR_GET(gpu_volatile_pages) && !REXCVAR_GET(gpu_native_residency) &&
++         !command_processor_.DiagnosticFlag(4096u);
++}
++
++void VulkanSharedMemory::FlushHoistedUploads() {
++  if (hoisted_copies_.empty()) {
++    return;
++  }
++  const size_t begin_position = command_processor_.render_pass_begin_position();
++  if (begin_position == SIZE_MAX) {
++    // Not expected (the command processor flushes while the pass is open); keep the copies in the
++    // stream at the current position rather than dropping them.
++    REXGPU_WARN("FlushHoistedUploads outside a render pass");
++  }
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  const size_t tail_start = command_buffer.Position();
++  VkPipelineStageFlags read_stage_mask;
++  VkAccessFlags read_access_mask;
++  GetUsageMasks(Usage::kRead, read_stage_mask, read_access_mask);
++  VkBufferMemoryBarrier barrier;
++  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++  barrier.pNext = nullptr;
++  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++  barrier.buffer = buffer_;
++  barrier.offset = 0;
++  barrier.size = VK_WHOLE_SIZE;
++  const bool barriers = !command_processor_.DiagnosticFlag(2u);
++  if (barriers) {
++    // Everything that used the buffer before (earlier passes, earlier copies) must be done with
++    // the ranges before the copies overwrite them.
++    barrier.srcAccessMask =
++        read_access_mask | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    command_buffer.CmdVkPipelineBarrier(read_stage_mask | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier,
++                                        0, nullptr);
++  }
++  size_t i = 0;
++  while (i < hoisted_copies_.size()) {
++    const VkBuffer src = hoisted_copies_[i].first;
+     upload_regions_.clear();
++    for (; i < hoisted_copies_.size() && hoisted_copies_[i].first == src; ++i) {
++      upload_regions_.push_back(hoisted_copies_[i].second);
++    }
++    command_buffer.CmdVkCopyBuffer(src, buffer_, uint32_t(upload_regions_.size()),
++                                   upload_regions_.data());
+   }
+-
+-  const size_t trailing_barrier_start = command_buffer.Position();
+-  if (!merging) {
++  upload_regions_.clear();
++  hoisted_copies_.clear();
++  if (barriers) {
+     // The copied data must be visible to the reads of the pass that follows.
+     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+     barrier.dstAccessMask = read_access_mask;
+-    if (!command_processor_.DiagnosticFlag(2u)) {
+-      command_buffer.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, read_stage_mask, 0, 0,
+-                                          nullptr, 1, &barrier, 0, nullptr);
+-    }
++    command_buffer.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, read_stage_mask, 0, 0,
++                                        nullptr, 1, &barrier, 0, nullptr);
+   }
+-
+-  if (merging) {
+-    // The copies go in front of the block's trailing barrier, which then still follows them all.
+-    command_buffer.MoveTailTo(tail_start, merge_position_);
+-    const size_t moved = command_buffer.Position() - tail_start;
+-    merge_position_ += moved;
+-    command_processor_.AdvanceRenderPassBeginPosition(moved);
+-  } else {
+-    // Move what was just recorded in front of the pass's begin command. Position() grew, and the
+-    // pass begin moved with the commands it follows, so the next hoist goes after this block.
++  if (begin_position != SIZE_MAX) {
+     command_buffer.MoveTailTo(tail_start, begin_position);
+-    const size_t moved = command_buffer.Position() - tail_start;
+-    merge_valid_ = true;
+-    merge_pass_serial_ = pass_serial;
+-    merge_position_ = begin_position + (trailing_barrier_start - tail_start);
+-    command_processor_.AdvanceRenderPassBeginPosition(moved);
++    command_processor_.AdvanceRenderPassBeginPosition(command_buffer.Position() - tail_start);
+   }
+-  hoisted_upload_failed_ = !successful;
+-  return true;
+ }
+ 
+ bool VulkanSharedMemory::UploadRanges(

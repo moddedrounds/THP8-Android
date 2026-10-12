@@ -41,3 +41,49 @@ compile_commands.json
 
 # Release staging output
 /dist/
+
+# --- Android port additions -------------------------------------------------
+# Disc archives and extracted dumps, wherever they land.
+*.7z
+*.rar
+/sources/
+/gamedata/
+/extracted/
+default.xex
+# Android / Gradle build output and signing material.
+.gradle/
+/android/**/build/
+/android/**/.cxx/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+# Logs and frame-time captures from test runs.
+*.log
+/perf/
+# Codegen writes rexglue.cmake (machine-specific SDK paths) beside the manifest.
+/config/generated/
+# Local symlinks so src/game's include(../config/generated/rexglue.cmake)
+# resolves; CMake joins its ../generated path lexically, so both are needed.
+/src/config
+/src/generated
+# Android codegen output and the local manifest (machine paths + a translation of the user's executable)
+/android/codegen/
+# Android build output
+/android/native-build/
+/android/app/src/main/jniLibs/
+/android/.gradle/
+/android/app/build/
+/android/build/
+# Gradle wrapper is copied from SDL3's Android project by tools/android/build_apk.sh
+/android/gradlew
+/android/gradle/
+/android/local.properties
+/android/native-build/
+
+# Bundled GPU driver (tools/android/fetch_turnip.sh)
+android/app/src/main/assets/drivers/
+
+# Launcher art made from the owner's own game (tools/android/make_launcher_art.py)
+/android/art-res/

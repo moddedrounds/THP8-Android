@@ -1,0 +1,80 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index cf009c3..a6e675a 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -520,6 +520,7 @@ class TextureCache {
+   // create the texture - if it's nullptr, occasionally a recreation attempt
+   // should be made.
+   Texture* FindOrCreateTexture(TextureKey key);
++  Texture* FindOrCreateTextureUncached(TextureKey key);
+ 
+   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
+     assert_true(load_shader_index < kLoadShaderCount);
+@@ -617,6 +618,24 @@ class TextureCache {
+   uint64_t current_submission_time_ = 0;
+ 
+   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
++  // Direct-mapped front of textures_ for FindOrCreateTexture (the node walk of the map was ~5 % of
++  // the command processor). Cleared whenever a texture is destroyed.
++  struct TextureFrontEntry {
++    TextureKey key;
++    Texture* texture = nullptr;
++  };
++  static constexpr uint32_t kTextureFrontCacheSize = 1024;
++  std::unique_ptr<TextureFrontEntry[]> texture_front_cache_{
++      new TextureFrontEntry[kTextureFrontCacheSize]};
++  void ClearTextureFrontCache() {
++    for (uint32_t i = 0; i < kTextureFrontCacheSize; ++i) texture_front_cache_[i].texture = nullptr;
++  }
++  static uint32_t TextureFrontIndex(const TextureKey& key) {
++    uint64_t words[2] = {};
++    std::memcpy(words, &key, std::min(sizeof(words), sizeof(key)));
++    uint64_t hash = (words[0] ^ (words[1] * 0x9E3779B97F4A7C15ull)) * 0xC2B2AE3D27D4EB4Full;
++    return uint32_t(hash >> 54) & (kTextureFrontCacheSize - 1);
++  }
+ 
+   uint64_t textures_total_host_memory_usage_ = 0;
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index e4653ab..5144234 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -297,6 +297,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
+     }
+     if (!destroyed_any) {
+       destroyed_any = true;
++      ClearTextureFrontCache();
+       // The texture being destroyed might have been bound in the previous
+       // submissions, and nothing has overwritten the binding yet, so completion
+       // of the submission where the texture was last actually used on the GPU
+@@ -775,11 +776,30 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
+ 
+ void TextureCache::DestroyAllTextures(bool from_destructor) {
+   ResetTextureBindings(from_destructor);
++  ClearTextureFrontCache();
+   textures_.clear();
+   COUNT_profile_set("gpu/texture_cache/textures", 0);
+ }
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
++  const bool front_cacheable = !IsDrawResolutionScaled();
++  TextureFrontEntry* front = nullptr;
++  if (front_cacheable) {
++    front = &texture_front_cache_[TextureFrontIndex(key)];
++    if (front->texture && front->key == key) {
++      return front->texture;
++    }
++  }
++  const TextureKey requested_key = key;
++  Texture* result = FindOrCreateTextureUncached(key);
++  if (front && result) {
++    front->key = requested_key;
++    front->texture = result;
++  }
++  return result;
++}
++
++TextureCache::Texture* TextureCache::FindOrCreateTextureUncached(TextureKey key) {
+   // Check if the texture is a scaled resolve texture.
+   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();

@@ -1,0 +1,44 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 56cc008..8e331ee 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -131,6 +131,14 @@ REXCVAR_DEFINE_BOOL(gpu_pacing_trace, false, "GPU",
+ 
+ // Frame-pacing trace (diagnostic): (time, code, arg) events from the CP, vsync and interrupt paths,
+ // dumped as one log line every 150 swaps covering the last 120 ms.
++REXCVAR_DEFINE_UINT32(gpu_regmem_yield_window_us, 1500, "GPU",
++                      "WAIT_REG_MEM (the game's vsync wait): yield-spin when the next guest vblank is "
++                      "closer than this; 0 = never spin, sleep up to the vblank and deliver it")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_UINT32(gpu_regmem_max_sleep_us, 125, "GPU",
++                      "WAIT_REG_MEM: longest sleep per poll (never past the next vblank minus the "
++                      "yield window)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(gpu_swap_cap_spin_us, 3000, "GPU",
+                       "The swap cap wait sleeps to this many microseconds before the target vblank "
+                       "and spins the rest. 0 = sleep only")
+@@ -1727,14 +1735,22 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (graphics_system_) {
+           graphics_system_->DeliverDueVblanks(true);  // a due vblank the vsync thread is late with
+         }
+-        if (!REXCVAR_GET(vsync) || TimeToNextGuestVblank() < std::chrono::microseconds(1500)) {
++        (void)kMaxPollWait;
++        const auto to_vblank = std::chrono::duration_cast<std::chrono::microseconds>(
++            TimeToNextGuestVblank());
++        const auto window = std::chrono::microseconds(REXCVAR_GET(gpu_regmem_yield_window_us));
++        if (!REXCVAR_GET(vsync) || (window.count() && to_vblank < window)) {
+           // User wants it fast and dangerous - or a vblank (what these waits usually wait for) is
+           // imminent and a sleep could wake milliseconds late.
+           rex::thread::MaybeYield();
+         } else {
+           auto requested = std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::milliseconds(wait / 0x100));
+-          rex::thread::Sleep(std::min(requested, kMaxPollWait));
++          auto sleep = std::min(requested,
++                                std::chrono::microseconds(REXCVAR_GET(gpu_regmem_max_sleep_us)));
++          // Not past the vblank: DeliverDueVblanks above delivers it from this thread when due.
++          sleep = std::min(sleep, std::max(to_vblank - window, std::chrono::microseconds(20)));
++          rex::thread::Sleep(sleep);
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();

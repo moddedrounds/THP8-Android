@@ -1,3 +1,6 @@
+> **Android port fork.** This fork adds an Android (arm64) build: see **[ANDROID.md](ANDROID.md)**.
+> No game data is included; you need your own legally obtained copy of the game.
+
 # Project8Recomp
 
 A native port of **Tony Hawk's Project 8** (Xbox 360, 2006), built by static

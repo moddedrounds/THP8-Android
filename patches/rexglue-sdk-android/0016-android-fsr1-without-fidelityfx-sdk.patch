@@ -1,0 +1,18 @@
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 38c39be..5e959cc 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -128,6 +128,13 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
+     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+ endif()
+ 
++# FSR 1 (EASU upscale + RCAS sharpen) and CAS need no FidelityFX SDK code: their shaders are prebuilt
++# (shaders/vulkan_spirv/guest_output_ffx_*) and the presenter computes their constants itself. Android
++# enables them without fetching the SDK; FSR 2/3 still need the SDK runtime.
++if(ANDROID AND NOT REXGLUE_FIDELITYFX_SOURCE_DIR)
++    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
++endif()
++
+ set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
+ if(TARGET amd_fidelityfx_vk)
+     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)

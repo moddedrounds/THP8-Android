@@ -1,0 +1,114 @@
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 4addde6..67d052e 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -25,6 +25,10 @@
+ 
+ #include <rex/cvar.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_volatile_compare_unlocked, true, "GPU",
++                    "Compare volatile pages with their shadows before taking the global critical "
++                    "region (only the valid bits need it); false = compare under the lock")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(gpu_volatile_demote_unchanged, 0, "GPU",
+                       "A volatile page (compared with its shadow at every request instead of being "
+                       "write-watched) found unchanged this many checks in a row goes back to "
+@@ -621,47 +625,63 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+     upload_ranges_.emplace_back(page_start, page_count);
+   };
+-  {
+-    auto global_lock = global_critical_region_.Acquire();
+-    volatile_unchanged_temp_.clear();
+-    if (volatile_count_) {
+-      const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+-      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+-        const uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+-        for (uint32_t page = range.first >> page_size_log2_; page <= page_last; ++page) {
+-          if (!page_volatile_[page]) {
+-            continue;
+-          }
+-          if (page_checked_epoch_[page] == batch_epoch_) {
+-            // Compared (and uploaded if it differed) earlier in this batch: in sync.
+-            system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++  // Volatile pages: compared with their shadow copies BEFORE taking the global critical region.
++  // The shadows, the per-batch check epochs and page_volatile_ are only touched by the command
++  // processor thread (the write-watch callbacks never touch volatile pages), so only the valid
++  // bits need the lock; the memcmp under the lock kept the guest's kernel object calls (which
++  // take the same lock) waiting, and every unlock had to wake one of them.
++  volatile_unchanged_temp_.clear();
++  // gpu_volatile_compare_unlocked = false: the old behaviour (compare under the lock), for A/B.
++  auto compare_lock = REXCVAR_GET(gpu_volatile_compare_unlocked)
++                          ? global_critical_region_.AcquireDeferred()
++                          : global_critical_region_.Acquire();
++  if (volatile_count_) {
++    const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++      const uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++      for (uint32_t page = range.first >> page_size_log2_; page <= page_last; ++page) {
++        if (!page_volatile_[page]) {
++          continue;
++        }
++        if (page_checked_epoch_[page] == batch_epoch_) {
++          // Compared (and uploaded if it differed) earlier in this batch: in sync.
++          volatile_unchanged_temp_.push_back(page);
++          continue;
++        }
++        page_checked_epoch_[page] = batch_epoch_;
++        const uint8_t* guest = reinterpret_cast<const uint8_t*>(
++            memory().TranslatePhysical(page << page_size_log2_));
++        std::unique_ptr<uint8_t[]>& shadow = page_shadow_[page];
++        if (shadow && !std::memcmp(guest, shadow.get(), page_bytes)) {
++          // Unchanged since it was last uploaded: in sync for this request.
++          const uint32_t demote_after = REXCVAR_GET(gpu_volatile_demote_unchanged);
++          if (demote_after && ++page_unchanged_checks_[page] >= std::min(demote_after, 255u)) {
++            // Stable again: back to write-watching (valid, re-protected) after this request.
++            volatile_demote_temp_.push_back(page);
++          } else {
+             volatile_unchanged_temp_.push_back(page);
+-            continue;
+           }
+-          page_checked_epoch_[page] = batch_epoch_;
+-          const uint8_t* guest = reinterpret_cast<const uint8_t*>(
+-              memory().TranslatePhysical(page << page_size_log2_));
+-          std::unique_ptr<uint8_t[]>& shadow = page_shadow_[page];
+-          if (shadow && !std::memcmp(guest, shadow.get(), page_bytes)) {
+-            // Unchanged since it was last uploaded: in sync for this request.
+-            system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
+-            const uint32_t demote_after = REXCVAR_GET(gpu_volatile_demote_unchanged);
+-            if (demote_after && ++page_unchanged_checks_[page] >= std::min(demote_after, 255u)) {
+-              // Stable again: back to write-watching (valid, re-protected) after this request.
+-              volatile_demote_temp_.push_back(page);
+-            } else {
+-              volatile_unchanged_temp_.push_back(page);
+-            }
+-          } else {
+-            page_unchanged_checks_[page] = 0;
+-            if (!shadow) {
+-              shadow.reset(new uint8_t[page_bytes]);
+-            }
+-            std::memcpy(shadow.get(), guest, page_bytes);
++        } else {
++          page_unchanged_checks_[page] = 0;
++          if (!shadow) {
++            shadow.reset(new uint8_t[page_bytes]);
+           }
++          std::memcpy(shadow.get(), guest, page_bytes);
+         }
+       }
+     }
++  }
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    if (compare_lock.owns_lock()) {
++      compare_lock.unlock();  // still held through global_lock (recursive)
++    }
++    for (uint32_t page : volatile_unchanged_temp_) {
++      system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++    }
++    for (uint32_t page : volatile_demote_temp_) {
++      system_page_flags_valid_[page >> 6] |= uint64_t(1) << (page & 63);
++    }
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
