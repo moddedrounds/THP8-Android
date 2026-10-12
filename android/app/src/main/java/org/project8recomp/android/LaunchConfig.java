@@ -127,7 +127,7 @@ final class LaunchConfig {
         return context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("render_scale", defaultRenderScale(context));
     }
 
-    // Frame rate modes: 0 = locked 30 shown at 60 with frame generation (default), 1 = locked 30,
+    // Frame rate modes: 0 = locked 30 shown at 60 with frame generation, 1 = locked 30 (default),
     // 2 = up to 60 (real frames; on a 60 Hz screen frames that miss 16.7 ms are shown for 33.3 ms),
     // 3 = up to 60 + frame generation: 120 shown on a 120 Hz screen (the game asks the display for
     // 120 Hz; needs the system's refresh rate setting at 120, else it is the same as mode 2).
@@ -143,7 +143,7 @@ final class LaunchConfig {
     }
 
     static int fpsMode(Context context) {
-        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("fps_mode", 0);
+        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getInt("fps_mode", 1);
     }
 
     static void setRenderScale(Context context, int scale) {
