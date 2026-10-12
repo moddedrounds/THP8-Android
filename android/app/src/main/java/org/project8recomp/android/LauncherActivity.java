@@ -43,6 +43,9 @@ public class LauncherActivity extends Activity {
     private Button installButton;
     private TextView installStatus;
     private volatile boolean installing;
+    private Button updateButton;
+    private UpdateChecker.Info pendingUpdate;
+    private volatile boolean updating;
 
     private static final int PICK_ISO = 1;
     // SHA-256 of the supported release's default.xex. The installer refuses any other executable.
@@ -121,6 +124,10 @@ public class LauncherActivity extends Activity {
         installButton = button("Select my Project 8 ISO", v -> pickIso());
         buttons.addView(playButton);
         buttons.addView(installButton);
+        if (UpdateChecker.enabled(this)) {
+            updateButton = button("Check for updates", v -> onUpdateButton());
+            buttons.addView(updateButton);
+        }
         buttons.addView(probe);
         buttons.addView(refresh);
         root.addView(buttons);
@@ -171,6 +178,9 @@ public class LauncherActivity extends Activity {
         (gameInstalled() ? playButton : installButton).requestFocus();
         refresh();
         runProbe();
+        if (UpdateChecker.enabled(this) && UpdateChecker.autoCheckDue(this)) {
+            checkForUpdates(false);
+        }
 
         if (getIntent().getBooleanExtra("play", false) && gameInstalled()) {
             startGame();
@@ -262,6 +272,78 @@ public class LauncherActivity extends Activity {
         }, "iso-install").start();
     }
 
+    private void onUpdateButton() {
+        if (updating || installing) return;
+        if (pendingUpdate != null) {
+            downloadAndInstall(pendingUpdate);
+        } else {
+            checkForUpdates(true);
+        }
+    }
+
+    private void checkForUpdates(boolean userAsked) {
+        updating = true;
+        updateButton.setText("Checking...");
+        new Thread(() -> {
+            UpdateChecker.Info info = null;
+            String error = null;
+            try {
+                info = UpdateChecker.check(this);
+            } catch (Throwable t) {
+                error = t.getMessage();
+            }
+            final UpdateChecker.Info found = info;
+            final String err = error;
+            runOnUiThread(() -> {
+                updating = false;
+                pendingUpdate = found;
+                if (found != null) {
+                    updateButton.setText("Update to v" + found.versionName);
+                    installStatus.setText("Update available: v" + found.versionName
+                            + (found.notes.isEmpty() ? "" : " - " + found.notes) + "  (tap \"Update to v"
+                            + found.versionName + "\")");
+                } else {
+                    updateButton.setText("Check for updates");
+                    if (userAsked) {
+                        installStatus.setText(err != null ? "Could not check for updates: " + err
+                                : "You have the latest version (v" + UpdateChecker.installedVersionName(this) + ").");
+                    }
+                }
+            });
+        }, "update-check").start();
+    }
+
+    private void downloadAndInstall(UpdateChecker.Info info) {
+        updating = true;
+        updateButton.setEnabled(false);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        new Thread(() -> {
+            String msg;
+            try {
+                final long[] lastUi = {0};
+                java.io.File apk = UpdateChecker.download(this, info, (done, total) -> {
+                    long now = System.currentTimeMillis();
+                    if (now - lastUi[0] < 250) return;
+                    lastUi[0] = now;
+                    String line = String.format(Locale.US, "Downloading v%s... %d%%  (%.0f / %.0f MB)", info.versionName,
+                            total > 0 ? (int) (done * 100 / total) : 0, done / 1e6, total / 1e6);
+                    runOnUiThread(() -> installStatus.setText(line));
+                });
+                UpdateChecker.install(this, apk);
+                msg = "Download verified. Confirm the update in the Android dialog; your game and saves are kept.";
+            } catch (Throwable t) {
+                msg = "Update failed: " + t.getMessage();
+            }
+            final String m = msg;
+            runOnUiThread(() -> {
+                updating = false;
+                updateButton.setEnabled(true);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                installStatus.setText(m);
+            });
+        }, "update-download").start();
+    }
+
     private void updateInstallLabels() {
         installButton.setText(gameInstalled() ? "Reinstall from ISO" : "Select my Project 8 ISO");
         if (!gameInstalled() && !installing && installStatus.getText().length() == 0) {
@@ -303,6 +385,8 @@ public class LauncherActivity extends Activity {
         Display display = getWindowManager().getDefaultDisplay();
         sb.append(String.format(Locale.US, "Display: %.0f Hz\n", display.getRefreshRate()));
 
+        sb.append("App version: ").append(UpdateChecker.installedVersionName(this))
+                .append(UpdateChecker.enabled(this) ? "" : " (development build, no update checks)").append('\n');
         File root = LaunchConfig.root(this);
         sb.append("\nData folder: ").append(root).append('\n');
         File xex = new File(LaunchConfig.gameDataRoot(this), "default.xex");

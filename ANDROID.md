@@ -22,6 +22,9 @@ You do not need a computer.
    or damaged image is refused with a message saying which file is broken.
 4. Tap **Play**. You can delete the `.iso` afterwards.
 
+Updates: the app checks for new versions itself (or tap **Check for updates**); one tap downloads,
+verifies and installs them, keeping your installed game and saves.
+
 Requirements: Android 10 or newer, ARM64, Vulkan, and about 6 GB free in addition to the ISO.
 Tested on the AYN Thor (Snapdragon 8 Gen 2); a controller is recommended. Other devices are untested.
 

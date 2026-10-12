@@ -30,6 +30,8 @@ android {
         versionCode = (findProperty("app.versionCode") as String?)?.toInt() ?: 1
         versionName = (findProperty("app.versionName") as String?) ?: "0.1.0-dev"
         ndk { abiFilters += "arm64-v8a" }
+        // In-app update checks read this update.json; empty (the default) = no checks (dev builds).
+        resValue("string", "update_manifest_url", (findProperty("app.updateUrl") as String?) ?: "")
         manifestPlaceholders["appIcon"] =
             if (hasArt) "@mipmap/ic_launcher" else "@android:drawable/sym_def_app_icon"
     }

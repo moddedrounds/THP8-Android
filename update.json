@@ -1,0 +1,8 @@
+{
+  "versionCode": 110,
+  "versionName": "1.1.0",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.1.0/THP8-Android.apk",
+  "sha256": "be05ea4b5e77e01bb5fea7dfb4123e89acf9a37a02b2db76851e4b6741b32c55",
+  "size": 72893551,
+  "notes": "In-app update checks"
+}
