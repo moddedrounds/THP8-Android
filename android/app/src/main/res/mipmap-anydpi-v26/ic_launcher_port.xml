@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Icon artwork made for the port (AI-generated, no game art or characters). -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_port_full"/>
+    <foreground android:drawable="@android:color/transparent"/>
+</adaptive-icon>

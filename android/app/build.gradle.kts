@@ -39,7 +39,7 @@ android {
         check(accepted.isNotEmpty()) { "no SHA-256 rows found in src/common/supported_dumps.h" }
         resValue("string", "accepted_xex_sha256", accepted.joinToString(","))
         manifestPlaceholders["appIcon"] =
-            if (hasArt) "@mipmap/ic_launcher" else "@android:drawable/sym_def_app_icon"
+            if (hasArt) "@mipmap/ic_launcher" else "@mipmap/ic_launcher_port"
     }
 
     val releaseStore = System.getenv("RELEASE_STORE_FILE")

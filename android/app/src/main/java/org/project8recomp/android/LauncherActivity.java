@@ -86,10 +86,16 @@ public class LauncherActivity extends Activity {
         // tools/android/make_launcher_art.py) when the build has it, dimmed so the text stays readable.
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(Color.rgb(18, 18, 22));
-        int bg = getResources().getIdentifier("launcher_bg", "drawable", getPackageName());
+        // The player's own game art when it has been taken from their installed copy (files/art), else the
+        // build's art-res background (development builds only; public builds ship no game art).
+        java.io.File ownArt = TitleCapture.file(this);
+        int bgRes = getResources().getIdentifier("launcher_bg", "drawable", getPackageName());
+        android.graphics.Bitmap ownBitmap = ownArt.isFile()
+                ? android.graphics.BitmapFactory.decodeFile(ownArt.getPath()) : null;
+        int bg = ownBitmap != null ? 1 : bgRes;
         if (bg != 0) {
             ImageView art = new ImageView(this);
-            art.setImageResource(bg);
+            if (ownBitmap != null) art.setImageBitmap(ownBitmap); else art.setImageResource(bgRes);
             art.setScaleType(ImageView.ScaleType.CENTER_CROP);
             frame.addView(art, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));

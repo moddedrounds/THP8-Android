@@ -110,6 +110,8 @@ public class GameActivity extends SDLActivity {
             android.util.Log.w("thps8", "driver copy failed", t);
         }
         super.onCreate(savedInstanceState);
+        // Launcher background from the game's own title screen (first launches only).
+        TitleCapture.start(this, mSurface);
         if (mLayout != null && !mBrokenLibraries) {
             menu = new InGameMenu(this, mLayout, LaunchConfig.renderScale(this), new InGameMenu.Native() {
                 @Override
