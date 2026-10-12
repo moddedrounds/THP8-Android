@@ -16,6 +16,7 @@
 #include "guest_vertex_unpack.h"
 #include "guest_wait_sleep.h"
 #include "guest_resolution.h"
+#include "guest_background_pause.h"
 #include "guest_present_interval.h"
 #include "thps_p8_app.h"
 

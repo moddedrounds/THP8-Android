@@ -5,6 +5,17 @@
 // the one thing only Android needs: handing the SDK the JavaVM, the activity and the folder the
 // native libraries were unpacked to before any subsystem starts.
 
+#include <atomic>
+#include <rex/system/util/object_table.h>
+#include <rex/system/xthread.h>
+#include <rex/system/kernel_state.h>
+#include <pthread.h>
+#include <vector>
+#include <condition_variable>
+#include <rex/runtime.h>
+#include <SDL3/SDL_events.h>
+#include <thread>
+#include <mutex>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_system.h>
 
@@ -89,6 +100,69 @@ void ShutdownAndroidContext() {
   rex::ShutdownAndroidSystem();
 }
 
+// The emulated console keeps running (and drawing) when the app is not visible, so a game left in
+// the background took a core and a share of the GPU from whatever ran in front (a second port, at
+// 35-45 instead of 60 fps). While in the background the game's frame loop parks in a per-frame hook
+// (rex_wait_while_in_background, called by the game hooks) and audio + the command processor pause.
+// Cooperative on purpose: suspending guest threads with signals left the main one spinning.
+namespace {
+std::mutex g_pause_mutex;
+std::condition_variable g_pause_cv;
+std::atomic<bool> g_in_background{false};
+bool g_want_paused = false;
+bool g_stop_pause_worker = false;
+
+// Audio / graphics pause and resume can block, so they run here, never on Android's UI thread.
+void PauseWorker() {
+  pthread_setname_np(pthread_self(), "bg pause");
+  bool paused = false;
+  std::unique_lock<std::mutex> lock(g_pause_mutex);
+  for (;;) {
+    g_pause_cv.wait(lock, [&] { return g_stop_pause_worker || g_want_paused != paused; });
+    const bool pause = g_stop_pause_worker ? false : g_want_paused;
+    if (pause != paused) {
+      rex::Runtime* runtime = rex::Runtime::instance();
+      if (pause) {
+        // Park only after audio / graphics acknowledged their pause: their workers must not be
+        // parked while those calls wait for them.
+        if (runtime && runtime->audio_system()) runtime->audio_system()->Pause();
+        if (runtime && runtime->graphics_system()) runtime->graphics_system()->Pause();
+        g_in_background = true;
+        LOGI("game paused in the background");
+      } else {
+        if (runtime && runtime->graphics_system()) runtime->graphics_system()->Resume();
+        if (runtime && runtime->audio_system()) runtime->audio_system()->Resume();
+        g_in_background = false;
+        g_pause_cv.notify_all();  // wakes the parked frame loop
+        LOGI("game resumed");
+      }
+      paused = pause;
+    }
+    if (g_stop_pause_worker && !paused) {
+      return;
+    }
+  }
+}
+
+bool SDLCALL BackgroundWatch(void*, SDL_Event* event) {
+  if (event->type == SDL_EVENT_DID_ENTER_BACKGROUND || event->type == SDL_EVENT_WILL_ENTER_FOREGROUND) {
+    std::lock_guard<std::mutex> lock(g_pause_mutex);
+    g_want_paused = event->type == SDL_EVENT_DID_ENTER_BACKGROUND;
+    g_pause_cv.notify_all();
+  }
+  return true;
+}
+}  // namespace
+
+// Called once per frame by the game hooks: blocks while the app is in the background.
+extern "C" void rex_wait_while_in_background() {
+  if (!g_in_background.load(std::memory_order_relaxed)) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(g_pause_mutex);
+  g_pause_cv.wait(lock, [] { return !g_in_background.load() || g_stop_pause_worker; });
+}
+
 // The desktop RunWindowedApp(), asking for the app by name: on Android the SDK registers apps in a
 // table (XE_UI_WINDOWED_APPS_IN_LIBRARY) instead of defining GetWindowedAppCreator().
 int RunGame(int argc, char** argv) {
@@ -128,8 +202,20 @@ int RunGame(int argc, char** argv) {
       // After initialisation so the game's threads exist and the log is open; the watcher also
       // picks up threads created later.
       auto affinity = thps::affinity::Start();
+      std::thread pause_worker(PauseWorker);
+      rex::system::XThread::delay_park_hook = &rex_wait_while_in_background;
+      SDL_AddEventWatch(BackgroundWatch, nullptr);
       thps::display_vsync::Start();
       result = app_context.RunMainMessageLoop();
+      SDL_RemoveEventWatch(BackgroundWatch, nullptr);
+      rex::system::XThread::delay_park_hook = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(g_pause_mutex);
+        g_want_paused = false;
+        g_stop_pause_worker = true;
+      }
+      g_pause_cv.notify_all();
+      pause_worker.join();
       affinity.reset();
     } else {
       result = EXIT_FAILURE;

@@ -77,8 +77,16 @@ inline void RecordWait(uint64_t elapsed_us, bool reached) {
 // has no equivalent C/C++ alias attribute, so Apple retains the generated
 // functions while these cvars remain available to the shared launcher preset.
 #if !defined(__APPLE__)
+#if defined(__ANDROID__)
+// android/native/src/android_main.cpp: blocks while the app is in the background.
+extern "C" void rex_wait_while_in_background();
+#endif
+
 REX_HOOK_RAW(sub_82397688) {
   REX_FUNC_PROLOGUE();
+#if defined(__ANDROID__)
+  rex_wait_while_in_background();  // poll loops park while in the background
+#endif
 
   if (REXCVAR_GET(guest_swap_wait) &&
       ctx.lr == thps::swap_wait::kWaitLoopReturn) {
@@ -103,6 +111,9 @@ REX_HOOK_RAW(sub_82397688) {
 
 REX_HOOK_RAW(sub_823975B8) {
   REX_FUNC_PROLOGUE();
+#if defined(__ANDROID__)
+  rex_wait_while_in_background();  // poll loops park while in the background
+#endif
 
   const bool enabled = REXCVAR_GET(guest_swap_wait);
   std::unique_lock<std::mutex> lock(thps::swap_wait::g_mutex, std::defer_lock);

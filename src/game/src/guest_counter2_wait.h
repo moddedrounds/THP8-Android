@@ -59,8 +59,16 @@ inline constexpr uint32_t kInterval = 0x82779C00;     // the limiter's frame int
 // Generated guest functions expose weak ELF aliases for title hooks; Mach-O has none (see the
 // other hook headers).
 #if !defined(__APPLE__)
+#if defined(__ANDROID__)
+// android/native/src/android_main.cpp: blocks while the app is in the background.
+extern "C" void rex_wait_while_in_background();
+#endif
+
 REX_HOOK_RAW(sub_82397698) {
   REX_FUNC_PROLOGUE();
+#if defined(__ANDROID__)
+  rex_wait_while_in_background();  // poll loops park while in the background
+#endif
 
   if (REXCVAR_GET(guest_counter2_wait) && ctx.lr == thps::counter2::kLoopReturn &&
       REX_LOAD_U64(thps::counter2::kCounter) < REX_LOAD_U64(thps::counter2::kDeadline)) {

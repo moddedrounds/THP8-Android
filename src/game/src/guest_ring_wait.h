@@ -108,8 +108,16 @@ inline void BackOff() {
 // has no equivalent C/C++ alias attribute, so Apple retains the generated
 // functions while these cvars remain available to the shared launcher preset.
 #if !defined(__APPLE__)
+#if defined(__ANDROID__)
+// android/native/src/android_main.cpp: blocks while the app is in the background.
+extern "C" void rex_wait_while_in_background();
+#endif
+
 REX_HOOK_RAW(sub_8235DF50) {
   REX_FUNC_PROLOGUE();
+#if defined(__ANDROID__)
+  rex_wait_while_in_background();  // poll loops park while in the background
+#endif
   uint32_t ea{};
   uint32_t empty_polls = 0;
   ctx.r12.u64 = ctx.lr;
@@ -213,6 +221,9 @@ loc_8235DFFC:
 
 REX_HOOK_RAW(sub_8235E068) {
   REX_FUNC_PROLOGUE();
+#if defined(__ANDROID__)
+  rex_wait_while_in_background();  // poll loops park while in the background
+#endif
   uint32_t ea{};
 
   const bool enabled = REXCVAR_GET(guest_ring_wait_event);

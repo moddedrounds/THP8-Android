@@ -1,0 +1,215 @@
+diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
+index 33fd32c..16d93a4 100644
+--- a/include/rex/audio/audio_system.h
++++ b/include/rex/audio/audio_system.h
+@@ -52,8 +52,8 @@ class AudioSystem : public system::IAudioSystem {
+   bool Restore(stream::ByteStream* stream);
+ 
+   bool is_paused() const { return paused_; }
+-  void Pause();
+-  void Resume();
++  void Pause() override;
++  void Resume() override;
+ 
+  protected:
+   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index 85d1966..e14f945 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -96,8 +96,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
+                                bool blocking) override;
+ 
+   bool is_paused() const { return paused_; }
+-  void Pause();
+-  void Resume();
++  void Pause() override;
++  void Resume() override;
+ 
+   bool Save(::rex::stream::ByteStream* stream);
+   bool Restore(::rex::stream::ByteStream* stream);
+diff --git a/include/rex/system/interfaces/audio.h b/include/rex/system/interfaces/audio.h
+index a934066..e72edc5 100644
+--- a/include/rex/system/interfaces/audio.h
++++ b/include/rex/system/interfaces/audio.h
+@@ -24,6 +24,9 @@ class IAudioSystem {
+   virtual ~IAudioSystem() = default;
+   virtual X_STATUS Setup(KernelState* kernel_state) = 0;
+   virtual void Shutdown() = 0;
++  // Stop / restart the audio worker and XMA decoding (the app going to the background).
++  virtual void Pause() {}
++  virtual void Resume() {}
+ };
+ 
+ }  // namespace rex::system
+diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
+index d54df86..80a471c 100644
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -52,6 +52,10 @@ class IGraphicsSystem {
+ 
+   // --- Optional capabilities, default no-op -------------------------------
+ 
++  // Stop / restart the command processor (the app going to the background).
++  virtual void Pause() {}
++  virtual void Resume() {}
++
+   // Host presentation objects for ReXApp's overlay wiring; custom systems may
+   // leave these null.
+   virtual ui::GraphicsProvider* provider() const { return nullptr; }
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..bb22448 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -380,6 +380,9 @@ class XThread : public XObject {
+   uint32_t SelfSuspend();
+ #endif
+   X_STATUS Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval);
++  // Called at the start of every guest sleep when set (the Android app parks guest threads there
++  // while it is in the background).
++  static void (*delay_park_hook)();
+ 
+   rex::thread::Thread* thread() { return thread_.get(); }
+   runtime::ThreadState* thread_state() { return thread_state_.get(); }
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 71e7473..2e5269a 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -42,6 +42,11 @@ class WindowSDL final : public Window {
+   void HandleMouseEvent(SDL_Event& event);
+   void HandleDropEvent(SDL_Event& event);
+   void HandlePaintEvent();
++  // Android: the app left (false) or came back to (true) the screen; the ANativeWindow behind
++  // the presenter surface is destroyed and re-created around that.
++  void HandleAndroidLifecycle(bool foreground);
++  // Android: re-create the presenter surface if SDL now has a different ANativeWindow.
++  void CheckAndroidSurface();
+ 
+  protected:
+   uint32_t GetLatestDpiImpl() const override;
+@@ -61,6 +66,7 @@ class WindowSDL final : public Window {
+   void RequestPaintImpl() override;
+ 
+  private:
++  void* android_native_window_ = nullptr;  // ANativeWindow the presenter surface uses
+   SDLWindowedAppContext& sdl_app_context() const {
+     return static_cast<SDLWindowedAppContext&>(app_context());
+   }
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index 9da317f..6b964a5 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -242,6 +242,11 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+ 
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
++  // Timed waits are how guest threads poll: park them while the app is in the background
++  // (XThread::delay_park_hook, set by the Android app).
++  if (opt_timeout && *opt_timeout != 0 && XThread::delay_park_hook && XThread::IsInThread()) {
++    XThread::delay_park_hook();
++  }
+   auto wait_handle = GetWaitHandle();
+   if (!wait_handle) {
+     // Object doesn't support waiting.
+@@ -302,6 +307,11 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
+                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                                uint64_t* opt_timeout) {
++  // Timed waits are how guest threads poll: park them while the app is in the background
++  // (XThread::delay_park_hook, set by the Android app).
++  if (opt_timeout && *opt_timeout != 0 && XThread::delay_park_hook && XThread::IsInThread()) {
++    XThread::delay_park_hook();
++  }
+   std::vector<rex::thread::WaitHandle*> wait_handles(count);
+   for (size_t i = 0; i < count; ++i) {
+     wait_handles[i] = objects[i]->GetWaitHandle();
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..fd3cd29 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -997,7 +997,12 @@ uint32_t XThread::SelfSuspend() {
+ }
+ #endif
+ 
++void (*XThread::delay_park_hook)() = nullptr;
++
+ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
++  if (delay_park_hook) {
++    delay_park_hook();
++  }
+   int64_t timeout_ticks = interval;
+   uint32_t timeout_ms;
+   if (timeout_ticks > 0) {
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index f705251..ae6f2fd 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -435,6 +435,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+           REXLOG_INFO("Android: requested a {} Hz display refresh: {}", refresh_hz, result);
+         }
+       }
++      android_native_window_ = native_window;
+       return std::make_unique<AndroidNativeWindowSurface>(native_window);
+     }
+   }
+@@ -479,8 +480,41 @@ void WindowSDL::HandlePaintEvent() {
+   OnPaint();
+ }
+ 
++void WindowSDL::HandleAndroidLifecycle(bool foreground) {
++#if REX_PLATFORM_ANDROID
++  if (!foreground) {
++    REXLOG_INFO("Android: app in the background, presenter surface released");
++    OnSurfaceChanged(false);
++    android_native_window_ = nullptr;
++    return;
++  }
++  CheckAndroidSurface();
++#else
++  (void)foreground;
++#endif
++}
++
++void WindowSDL::CheckAndroidSurface() {
++#if REX_PLATFORM_ANDROID
++  void* current = SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
++                                         SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
++  if (current && current != android_native_window_) {
++    REXLOG_INFO("Android: new native window, re-creating the presenter surface");
++    OnSurfaceChanged(true);
++    OnPaint(true);
++  }
++#endif
++}
++
+ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+   WindowDestructionReceiver destruction_receiver(this);
++#if REX_PLATFORM_ANDROID
++  if (event.type == SDL_EVENT_WINDOW_EXPOSED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
++      event.type == SDL_EVENT_WINDOW_RESTORED || event.type == SDL_EVENT_WINDOW_FOCUS_GAINED ||
++      event.type == SDL_EVENT_WINDOW_SHOWN) {
++    CheckAndroidSurface();
++  }
++#endif
+   switch (event.type) {
+     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+       OnActualSizeUpdate(uint32_t(event.window.data1), uint32_t(event.window.data2),
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..4acff67 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -130,6 +130,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+     return;
+   }
+   switch (event.type) {
++#if REX_PLATFORM_ANDROID
++    case SDL_EVENT_WILL_ENTER_BACKGROUND:
++    case SDL_EVENT_DID_ENTER_FOREGROUND:
++      for (auto& [id, window] : windows_) {
++        window->HandleAndroidLifecycle(event.type == SDL_EVENT_DID_ENTER_FOREGROUND);
++      }
++      break;
++#endif
+     case SDL_EVENT_QUIT:
+       if (synchronously_handled_quit_events_ != 0) {
+         --synchronously_handled_quit_events_;
