@@ -10,15 +10,28 @@ Status: playable on the AYN Thor, with 30 and 60 fps modes; busy areas can still
 Details, measurements and open items are in [`PROGRESS.md`](PROGRESS.md). Use the same disc release
 that upstream Project8Recomp supports (see [README.md](README.md)).
 
+## Players: start here
+
+You do not need a computer.
+
+1. **[Download the APK](https://github.com/moddedrounds/THP8-Android/releases/latest/download/THP8-Android.apk)** and install it (allow installing from your browser / file manager).
+2. Make a disc image (`.iso`) from **your own** Tony Hawk's Project 8 Xbox 360 disc (USA/Europe retail (title 415607DD)) and put it on
+   the device.
+3. Open the app and tap **Select my Project 8 ISO**. Pick your `.iso`. The app extracts it to its
+   own storage and checks it: the game executable must be the supported release, and an incomplete
+   or damaged image is refused with a message saying which file is broken.
+4. Tap **Play**. You can delete the `.iso` afterwards.
+
+Requirements: Android 10 or newer, ARM64, Vulkan, and about 6 GB free in addition to the ISO.
+Tested on the AYN Thor (Snapdragon 8 Gen 2); a controller is recommended. Other devices are untested.
+
 ## Legal: bring your own game
 
-**This repository contains no game data.** No disc image, no `default.xex`, no extracted files, no
-recompiled game code and no prebuilt APK are included, and none will be provided. To use this port
-you need **your own legally obtained copy** of the original Xbox 360 game, dumped from a disc you
-own. Requests for game files will be closed without reply.
-
-An APK you build from this repository contains a translation of your copy of the game's code.
-It is for your own devices: do not upload or share it.
+**No game data is distributed here.** The repository and the APK contain no disc image, no
+`default.xex`, no textures, models, sounds, movies or other files from the disc. To play you need
+**your own legally obtained copy** of the original Xbox 360 game, dumped from a disc you own; the app
+reads it on your device and nothing is uploaded anywhere. Requests for game files or ISOs will be
+closed without reply.
 
 ## What you need
 
@@ -35,7 +48,7 @@ It is for your own devices: do not upload or share it.
 - An arm64 Android device with a Vulkan 1.1+ GPU. Development and testing were done on an
   **AYN Thor (Snapdragon 8 Gen 2 / Adreno 740, Android 13)**; other devices are untested.
 
-## Building
+## Building it yourself
 
 The scripts expect the SDK tree and helper checkouts **next to** this repository:
 

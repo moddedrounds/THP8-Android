@@ -1,7 +1,9 @@
 // The APK only packages: the native libraries are built separately by tools/android/build_native.sh
 // (clearer logs and incremental builds than driving CMake through Gradle) and staged into jniLibs.
 //
-// A build WITH the game's translated code inside is for the user's own devices only: never publish it.
+// Signing: a release key when RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS /
+// RELEASE_KEY_PASSWORD are set in the environment (keep the keystore out of the repository), otherwise
+// the local debug key. -Papp.versionCode=N / -Papp.versionName=X override the version.
 
 plugins {
     id("com.android.application")
@@ -25,18 +27,29 @@ android {
         applicationId = "org.project8recomp.android"
         minSdk = 29      // memfd / ASharedMemory and a linker with the namespaces the SDK needs
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-m3"
+        versionCode = (findProperty("app.versionCode") as String?)?.toInt() ?: 1
+        versionName = (findProperty("app.versionName") as String?) ?: "0.1.0-dev"
         ndk { abiFilters += "arm64-v8a" }
         manifestPlaceholders["appIcon"] =
             if (hasArt) "@mipmap/ic_launcher" else "@android:drawable/sym_def_app_icon"
     }
 
+    val releaseStore = System.getenv("RELEASE_STORE_FILE")
+    signingConfigs {
+        if (releaseStore != null) {
+            create("release") {
+                storeFile = file(releaseStore)
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the local debug key: this APK is for the owner's own devices, not a store.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseStore != null) "release" else "debug")
         }
     }
 

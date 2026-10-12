@@ -2,6 +2,8 @@ package org.project8recomp.android;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.net.Uri;
+import android.view.WindowManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Build;
@@ -38,6 +40,13 @@ public class LauncherActivity extends Activity {
     private Button frameGenButton;
     private Button upscalerButton;
     private Button showFpsButton;
+    private Button installButton;
+    private TextView installStatus;
+    private volatile boolean installing;
+
+    private static final int PICK_ISO = 1;
+    // SHA-256 of the supported release's default.xex. The installer refuses any other executable.
+    static final String[] ACCEPTED_XEX_SHA256 = {"cfc732340e55defda400e25f03231aa9bb65fd9545b618212f69a4952384a5dd"};
 
     private void nextRenderScale() {
         int current = LaunchConfig.renderScale(this);
@@ -97,13 +106,21 @@ public class LauncherActivity extends Activity {
         title.setShadowLayer(6f, 0f, 2f, Color.BLACK);
         root.addView(title);
 
+        installStatus = new TextView(this);
+        installStatus.setTextColor(Color.rgb(255, 220, 120));
+        installStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        installStatus.setShadowLayer(6f, 0f, 2f, Color.BLACK);
+        root.addView(installStatus);
+
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setGravity(Gravity.START);
         playButton = button("Play", v -> startGame());
         Button probe = button("Run Vulkan probe", v -> runProbe());
         Button refresh = button("Refresh", v -> refresh());
+        installButton = button("Select my Project 8 ISO", v -> pickIso());
         buttons.addView(playButton);
+        buttons.addView(installButton);
         buttons.addView(probe);
         buttons.addView(refresh);
         root.addView(buttons);
@@ -150,11 +167,12 @@ public class LauncherActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
         setContentView(frame);
-        playButton.requestFocus();
+        updateInstallLabels();
+        (gameInstalled() ? playButton : installButton).requestFocus();
         refresh();
         runProbe();
 
-        if (getIntent().getBooleanExtra("play", false)) {
+        if (getIntent().getBooleanExtra("play", false) && gameInstalled()) {
             startGame();
         }
     }
@@ -172,8 +190,84 @@ public class LauncherActivity extends Activity {
                 getResources().getDisplayMetrics()));
     }
 
+    private boolean gameInstalled() {
+        return LaunchConfig.gameInstalled(this);
+    }
+
     private void startGame() {
+        if (installing) return;
+        if (!gameInstalled()) {
+            installStatus.setText("Install the game first: tap \"" + installButton.getText()
+                    + "\" and pick the disc image you made from your own copy.");
+            installButton.requestFocus();
+            return;
+        }
         startActivity(new Intent(this, GameActivity.class));
+    }
+
+    private void pickIso() {
+        if (installing) return;
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, PICK_ISO);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_ISO || resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        final Uri uri = data.getData();
+        installing = true;
+        playButton.setEnabled(false);
+        installButton.setEnabled(false);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        installStatus.setText("Reading the disc image...");
+        new Thread(() -> {
+            String result;
+            boolean ok;
+            final long[] lastUi = {0};
+            try {
+                result = IsoInstaller.install(this, uri, LaunchConfig.gameDataRoot(this), ACCEPTED_XEX_SHA256,
+                        (done, total, file) -> {
+                            long now = System.currentTimeMillis();
+                            if (now - lastUi[0] < 250) return;
+                            lastUi[0] = now;
+                            String line = String.format(Locale.US, "Installing... %d%%  (%.1f / %.1f GB)  %s",
+                                    total > 0 ? (int) (done * 100 / total) : 0, done / 1e9, total / 1e9, file);
+                            runOnUiThread(() -> installStatus.setText(line));
+                        });
+                ok = true;
+            } catch (IsoInstaller.Failure f) {
+                result = f.getMessage();
+                ok = false;
+            } catch (Throwable t) {
+                result = "Install failed: " + t;
+                ok = false;
+            }
+            final String msg = result;
+            final boolean success = ok;
+            runOnUiThread(() -> {
+                installing = false;
+                playButton.setEnabled(true);
+                installButton.setEnabled(true);
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                installStatus.setText(success ? msg + " Press Play." : "Not installed: " + msg);
+                updateInstallLabels();
+                refresh();
+                (success ? playButton : installButton).requestFocus();
+            });
+        }, "iso-install").start();
+    }
+
+    private void updateInstallLabels() {
+        installButton.setText(gameInstalled() ? "Reinstall from ISO" : "Select my Project 8 ISO");
+        if (!gameInstalled() && !installing && installStatus.getText().length() == 0) {
+            installStatus.setText("First time: tap \"Select my Project 8 ISO\" and pick the disc image you made"
+                    + " from your own copy of the game. It is extracted and checked on this device.");
+        }
     }
 
     private void runProbe() {
@@ -214,7 +308,7 @@ public class LauncherActivity extends Activity {
         File xex = new File(LaunchConfig.gameDataRoot(this), "default.xex");
         sb.append("Game data:   ").append(xex.isFile()
                 ? "found (default.xex " + xex.length() + " bytes)"
-                : "NOT FOUND - copy the extracted disc to " + LaunchConfig.gameDataRoot(this)).append('\n');
+                : "NOT INSTALLED - use \"Select my ISO\"").append('\n');
 
         File libs = new File(getApplicationInfo().nativeLibraryDir);
         sb.append("Native libs: ");
