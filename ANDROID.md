@@ -27,7 +27,7 @@ verifies and installs them, keeping your installed game and saves.
 
 Requirements: Android 10 or newer, ARM64, Vulkan, and about 6 GB free in addition to the ISO.
 Tested on the AYN Thor (Snapdragon 8 Gen 2) and a Galaxy S25 Ultra (Snapdragon 8 Elite); a
-controller is recommended. See *Which phones work* below.
+**controller is required** (there are no touch controls). See *Which phones work* below.
 
 ## Which phones work (v1.2.0)
 
@@ -140,6 +140,21 @@ options can be put one per line in `files/args.txt`.
 launch, menu driving, frame-time and power capture over adb). They assume `adb` on `PATH` (or `ADB`
 set to its path) and a work folder named in the first lines of each script: edit those to your own
 layout. `PROGRESS.md` is the full development log.
+
+## Contributing to the Android port
+
+Testing was done on two devices (AYN Thor, Galaxy S25 Ultra). Everything else depends on people with
+other phones:
+
+- **Device reports** - no coding needed: open an issue with the *Device report* form. Reports of
+  phones that work are as useful as reports of problems.
+- **Fixes for other phones** (Exynos, MediaTek, Tensor, older Snapdragon...) are welcome as pull
+  requests. Keep changes behind the existing launcher options / cvars where possible so other devices
+  are not affected, and say which device you tested on.
+- **Touch controls will not be added to this repository.** These are controller games; a fork is the
+  place for them.
+- **No game data** (ISOs, `default.xex`, textures, extracted files) in issues, pull requests or forks
+  linked from here. Such issues are closed and such pull requests are not merged.
 
 ## Credits
 
