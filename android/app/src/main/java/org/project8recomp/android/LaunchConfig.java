@@ -233,16 +233,17 @@ final class LaunchConfig {
     // Turnip on Adreno 6xx / 7xx, AUTO_8XX on Adreno 8xx, and the phone's own driver on everything
     // else (Mali, PowerVR, Xclipse, older Adreno). Before using a custom driver the game checks that
     // it finds the GPU, and falls back to the phone's driver when it does not (custom_driver.cpp).
-    static final int DRIVER_AUTO = 0, DRIVER_SYSTEM = 1, DRIVER_TURNIP = 2, DRIVER_TURNIP8 = 3;
+    static final int DRIVER_AUTO = 0, DRIVER_SYSTEM = 1, DRIVER_TURNIP = 2, DRIVER_TURNIP8 = 3, DRIVER_CUSTOM = 4;
     static final String[] DRIVER_NAMES = {"Automatic", "Phone's own", "Turnip (Adreno 6xx/7xx)",
-            "Turnip 8xx (experimental)"};
+            "Turnip 8xx (experimental)", "Custom"};
     // Folder under assets/drivers/ (tools/android/fetch_turnip.sh) and the library inside it.
     // Turnip 6xx/7xx falls back to the newer a8xx build (Mesa main) on Adreno 7xx variants R8 does not
     // know; the game uses the first folder whose driver finds the GPU (custom_driver.cpp).
-    private static final String[] DRIVER_FOLDERS = {null, null, "turnip,turnip8", "turnip8"};
-    private static final String[] DRIVER_LIBS = {null, null, "vulkan.ad07xx.so", "libvulkan_freedreno.so"};
+    // "custom" = a driver zip the player imported (DriverImport).
+    private static final String[] DRIVER_FOLDERS = {null, null, "turnip,turnip8", "turnip8", "custom"};
+    private static final String[] DRIVER_LIBS = {null, null, "vulkan.ad07xx.so", "libvulkan_freedreno.so", null};
     // The a8xx build draws with page faults through GMEM on the Adreno 830; sysmem rendering is clean.
-    private static final String[] DRIVER_ENV = {null, null, null, "TU_DEBUG=sysmem"};
+    private static final String[] DRIVER_ENV = {null, null, null, "TU_DEBUG=sysmem", null};
     // Turnip renders without the stock Adreno driver's blue-haze / flicker bug (Thor's Adreno 740,
     // and the S25 Ultra's Adreno 830 with the a8xx build) and skates as fast or faster.
     static final int AUTO_8XX = DRIVER_TURNIP8;
@@ -278,7 +279,30 @@ final class LaunchConfig {
 
     static String driverLabel(Context context) {
         int choice = driverChoice(context);
+        if (choice == DRIVER_CUSTOM) {
+            return "Custom: " + customDriverName(context) + (hasCustomDriver(context) ? "" : " (missing)");
+        }
         return choice == DRIVER_AUTO ? "Automatic (" + DRIVER_NAMES[autoDriver(context)] + ")" : DRIVER_NAMES[choice];
+    }
+
+    /** Next choice for the launcher button; Custom only once a driver has been imported. */
+    static int nextDriverChoice(Context context) {
+        int next = (driverChoice(context) + 1) % DRIVER_NAMES.length;
+        if (next == DRIVER_CUSTOM && !hasCustomDriver(context)) next = DRIVER_AUTO;
+        return next;
+    }
+
+    static String customDriverName(Context context) {
+        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getString("custom_driver_name", "none");
+    }
+
+    private static String customDriverLib(Context context) {
+        return context.getSharedPreferences("options", Context.MODE_PRIVATE).getString("custom_driver_lib", "");
+    }
+
+    static boolean hasCustomDriver(Context context) {
+        String lib = customDriverLib(context);
+        return !lib.isEmpty() && new File(context.getFilesDir(), "drivers/custom/" + lib).isFile();
     }
 
     /** What the last launch actually ran on, as written by the game (custom_driver.cpp). */
@@ -296,7 +320,7 @@ final class LaunchConfig {
         int driver = effectiveDriver(context);
         if (DRIVER_FOLDERS[driver] == null) return;
         args.add("--android_vulkan_driver=" + DRIVER_FOLDERS[driver]);
-        args.add("--android_vulkan_driver_lib=" + DRIVER_LIBS[driver]);
+        args.add("--android_vulkan_driver_lib=" + (driver == DRIVER_CUSTOM ? customDriverLib(context) : DRIVER_LIBS[driver]));
         if (DRIVER_ENV[driver] != null) args.add("--android_vulkan_driver_env=" + DRIVER_ENV[driver]);
     }
 

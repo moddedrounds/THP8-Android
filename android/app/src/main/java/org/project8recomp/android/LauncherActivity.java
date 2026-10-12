@@ -158,11 +158,12 @@ public class LauncherActivity extends Activity {
         options.addView(frameGenButton);
         options.addView(showFpsButton);
         driverButton = button("", v -> {
-            LaunchConfig.setDriverChoice(this, (LaunchConfig.driverChoice(this) + 1) % LaunchConfig.DRIVER_NAMES.length);
+            LaunchConfig.setDriverChoice(this, LaunchConfig.nextDriverChoice(this));
             updateOptionLabels();
             refresh();
         });
         options.addView(driverButton);
+        options.addView(button("Import driver (.zip)", v -> pickDriver()));
         // Scrolls sideways when the row is wider than the screen.
         android.widget.HorizontalScrollView optionsScroll = new android.widget.HorizontalScrollView(this);
         optionsScroll.addView(options);
@@ -230,6 +231,40 @@ public class LauncherActivity extends Activity {
         startActivity(new Intent(this, GameActivity.class));
     }
 
+    private static final int PICK_DRIVER = 7302;
+
+    /** A Turnip / AdrenoTools driver zip from storage (DriverImport). */
+    private void pickDriver() {
+        if (installing) return;
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, PICK_DRIVER);
+    }
+
+    private void importDriver(Uri uri) {
+        installStatus.setText("Importing the driver...");
+        new Thread(() -> {
+            String msg;
+            try {
+                String name = DriverImport.importZip(this, uri);
+                LaunchConfig.setDriverChoice(this, LaunchConfig.DRIVER_CUSTOM);
+                msg = "Driver imported: " + name + ". Graphics driver set to it; if it cannot run on this GPU the "
+                        + "game uses the phone's own driver instead.";
+            } catch (DriverImport.Failure f) {
+                msg = "Driver not imported: " + f.getMessage();
+            } catch (Throwable t) {
+                msg = "Driver not imported: " + t;
+            }
+            final String m = msg;
+            runOnUiThread(() -> {
+                installStatus.setText(m);
+                updateOptionLabels();
+                refresh();
+            });
+        }, "driver-import").start();
+    }
+
     private void pickIso() {
         if (installing) return;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -241,6 +276,10 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_DRIVER && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            importDriver(data.getData());
+            return;
+        }
         if (requestCode != PICK_ISO || resultCode != RESULT_OK || data == null || data.getData() == null) {
             return;
         }

@@ -29,7 +29,7 @@ Requirements: Android 10 or newer, ARM64, Vulkan, and about 6 GB free in additio
 Tested on the AYN Thor (Snapdragon 8 Gen 2) and a Galaxy S25 Ultra (Snapdragon 8 Elite); a
 **controller is required** (there are no touch controls). See *Which phones work* below.
 
-## Which phones work (v1.2.0)
+## Which phones work
 
 | GPU (chip) | Graphics driver the app picks | Status |
 |---|---|---|
@@ -40,6 +40,9 @@ Tested on the AYN Thor (Snapdragon 8 Gen 2) and a Galaxy S25 Ultra (Snapdragon 8
 - The launcher's **Graphics driver** button switches between *Automatic*, *Phone's own*, *Turnip* and
   *Turnip 8xx*. Before using a bundled driver the game checks that it finds your GPU; if not, it uses
   the phone's own driver automatically. The launcher shows which driver the last launch used.
+- **Import driver (.zip)** in the launcher loads a Turnip / AdrenoTools driver package from your
+  storage (e.g. a newer build for your GPU) and selects it as *Custom*; if it cannot run on your GPU the
+  game falls back to the phone's own driver.
 - The phone's own Adreno driver draws a blue haze / flickering textures in these games; that is why
   Turnip is the default on Snapdragon.
 - **Phones throttle when hot.** Turn **Power saving / Battery saver off** (the launcher warns you when
