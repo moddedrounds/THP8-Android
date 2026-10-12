@@ -1,8 +1,8 @@
 {
-  "versionCode": 122,
-  "versionName": "1.2.2",
-  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.2/THP8-Android.apk",
-  "sha256": "73107e78ad2d3e9ebbd00240f7ec80ca03342bce566ddec50357e70eb1aacb1e",
-  "size": 86881185,
-  "notes": "New: Import driver (.zip) - load a Turnip / AdrenoTools driver from your storage."
+  "versionCode": 123,
+  "versionName": "1.2.3",
+  "apk": "https://github.com/moddedrounds/THP8-Android/releases/download/v1.2.3/THP8-Android.apk",
+  "sha256": "57dd903ab242be08b4aaa8f9260ed6d5f5d76dffd5bfbc187470d332b4407f98",
+  "size": 87255289,
+  "notes": "New icon; the launcher background now comes from your own installed game."
 }
